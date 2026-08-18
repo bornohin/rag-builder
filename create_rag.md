@@ -1554,6 +1554,7 @@ Tools
   reindex                refresh the index after edits (incremental by default)
 """
 import functools
+import math
 import os
 import re
 import subprocess
@@ -1700,6 +1701,25 @@ def _staleness_banner():
 # ---------------------------------------------------------------------------
 VALID_CATEGORIES = ("source_code", "documentation", "config", "all")
 
+# Chroma pushes a $in filter down into its SQLite store. Measured on this
+# stack: 400 values 0.008s, 10k 0.013s, 32k 0.034s, failing only past ~40k on
+# SQLite's variable limit. The previous cap of 400 was therefore ~80x more
+# conservative than the engine requires, and every filter above it fell back
+# to post-filtering -- silently, and precisely when a repo is big enough for
+# the pushdown to matter. 10k keeps ~3x headroom under the measured ceiling.
+PUSHDOWN_MAX_PATHS = int(os.environ.get("RAG_PUSHDOWN_MAX_PATHS", "10000"))
+
+# Candidates each retriever returns before fusion, per requested result.
+# A fixed multiple stops meaning anything as the corpus grows: 40 candidates
+# is 2% of a 2k-chunk index but 0.06% of a 64k-chunk one, and RRF can only
+# rank what retrieval actually found. So the pool follows the square root of
+# corpus size -- deeper haystack, deeper look -- normalised so that at
+# POOL_REFERENCE_CHUNKS the multipliers are exactly what they always were.
+POOL_PER_RESULT = int(os.environ.get("RAG_POOL_PER_RESULT", "4"))
+POOL_PER_RESULT_FILTERED = int(os.environ.get("RAG_POOL_PER_RESULT_FILTERED", "10"))
+POOL_REFERENCE_CHUNKS = int(os.environ.get("RAG_POOL_REFERENCE_CHUNKS", "2000"))
+POOL_MAX = int(os.environ.get("RAG_POOL_MAX", "500"))
+
 
 def _matching_filepaths(index, path_filter):
     if not path_filter:
@@ -1709,17 +1729,51 @@ def _matching_filepaths(index, path_filter):
 
 
 def _where_clause(category, filepaths):
+    """Build the Chroma filter. Returns (where, pushed_down).
+
+    Pushing the path filter into Chroma (instead of dropping hits afterwards)
+    is what stops a narrow filter from returning an empty result while the
+    matching code sits just outside the global top-k. The caller needs to know
+    whether that actually happened, because if it did not, the candidate pool
+    has to grow to compensate.
+    """
     clauses = []
     if category and category != "all":
         clauses.append({"doc_category": {"$eq": category}})
-    # Pushing the path filter into Chroma (instead of dropping hits afterwards)
-    # is what stops a narrow filter from returning an empty result while the
-    # matching code sits just outside the global top-k.
-    if filepaths is not None and 0 < len(filepaths) <= 400:
+    pushed_down = False
+    if filepaths is not None and 0 < len(filepaths) <= PUSHDOWN_MAX_PATHS:
         clauses.append({"filepath": {"$in": filepaths}})
+        pushed_down = True
     if not clauses:
-        return None
-    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+        return None, pushed_down
+    return (clauses[0] if len(clauses) == 1 else {"$and": clauses}), pushed_down
+
+
+def _candidate_pool(top_k, n_chunks, n_files, filepaths, pushed_down):
+    """How many candidates each retriever returns before fusion.
+
+    Two effects, both of which used to be fixed constants:
+
+      * corpus size -- sqrt-scaled, so a 32x bigger index looks ~5.7x deeper
+        rather than staying at the same absolute (and increasingly tiny) slice;
+      * filter selectivity -- when the path filter could NOT be pushed down,
+        post-filtering will discard most of what comes back, so over-fetch by
+        the inverse of the fraction of the repo the filter matched.
+
+    At POOL_REFERENCE_CHUNKS with a pushdown this returns exactly the old
+    values (top_k*4 unfiltered, top_k*10 filtered), so small repos see no
+    change at all.
+    """
+    per_result = POOL_PER_RESULT_FILTERED if filepaths is not None else POOL_PER_RESULT
+    pool = top_k * per_result
+    if n_chunks > POOL_REFERENCE_CHUNKS:
+        pool = int(pool * math.sqrt(float(n_chunks) / POOL_REFERENCE_CHUNKS))
+    if filepaths is not None and not pushed_down and n_files:
+        # Floor the selectivity so a pathological filter cannot demand the
+        # whole corpus; POOL_MAX clamps it regardless.
+        selectivity = max(float(len(filepaths)) / n_files, 0.02)
+        pool = int(pool / selectivity)
+    return max(top_k, min(pool, POOL_MAX, n_chunks))
 
 
 def _rrf(ranked_lists, weights=None, k=None, top_n=10, boosts=None):
@@ -1842,9 +1896,9 @@ def search_codebase(query: str, category: str = "source_code",
     # --- dense -------------------------------------------------------------
     prefixed = cfg.query_prefix() + query
     embedding = list(_model().embed([prefixed]))[0].tolist()
-    where = _where_clause(category, filepaths)
-    # Over-fetch harder when filtering, so post-filtering can never starve.
-    n_results = min(len(chunks), top_k * (10 if filepaths else 4))
+    where, pushed_down = _where_clause(category, filepaths)
+    n_results = _candidate_pool(top_k, len(chunks), len(index.get("manifest", {})),
+                                filepaths, pushed_down)
     res = _collection().query(query_embeddings=[embedding], n_results=n_results,
                               where=where, include=["metadatas"])
     dense_ids = []
@@ -1896,10 +1950,13 @@ def search_codebase(query: str, category: str = "source_code",
     fused, reranked = _rerank(query, candidates, chunks, top_k)
 
     body = "\n\n".join(_format_hit(chunks[cid], return_skeletons) for cid in fused)
-    header = ("%d result(s) for '%s' [dense=%d, lexical=%d | %s query -> "
-              "weights d%.1f/l%.1f%s%s]\n\n"
-              % (len(fused), query, len(dense_ids), len(lexical_ids), shape,
-                 w_dense, w_lex,
+    header = ("%d result(s) for '%s' [dense=%d, lexical=%d of pool %d%s | %s "
+              "query -> weights d%.1f/l%.1f%s%s]\n\n"
+              % (len(fused), query, len(dense_ids), len(lexical_ids), n_results,
+                 "" if filepaths is None else
+                 (", %d files pushed down" % len(filepaths) if pushed_down
+                  else ", %d files POST-filtered" % len(filepaths)),
+                 shape, w_dense, w_lex,
                  ", %d symbol-boosted" % len(boosts) if boosts else "",
                  ", cross-encoder reranked" if reranked else ""))
     return header + body + _staleness_banner()
@@ -2173,6 +2230,11 @@ def rag_status() -> str:
         "Token counting  : %s" % ("exact (encoder tokenizer)" if cfg.TOKENIZER_AVAILABLE
                                   else "estimated (tokenizer not cached)"),
         "Fusion          : weighted RRF k=%d, symbol boost %.2f" % (cfg.RRF_K, cfg.SYMBOL_BOOST),
+        "Candidate pool  : %d unfiltered / %d filtered (top_k=10), max %d" % (
+            _candidate_pool(10, len(chunks), len(index.get("manifest", {})), None, False),
+            _candidate_pool(10, len(chunks), len(index.get("manifest", {})), [], True),
+            POOL_MAX),
+        "Path pushdown   : up to %s files per query" % f"{PUSHDOWN_MAX_PATHS:,}",
         "Reranker        : %s" % (
             ("%s (active)" % cfg.RERANKER_MODEL) if _reranker()
             else ("%s (set but unavailable -- see rag.log)" % cfg.RERANKER_MODEL
@@ -2778,6 +2840,7 @@ answers better.
 | `rag_status` says "estimated (tokenizer not cached)" | `tokenizer.json` missing from `.models_cache` | Re-run `download_model.py`; chunking still works but over-splits conservatively |
 | Reranker line says "set but unavailable" | `RAG_RERANKER` names a model that was never cached | `RAG_RERANKER=... python3 download_model.py` while online, or unset it |
 | A pre-existing git hook stopped running | It was replaced by an older installer version | Look for `<hook>.pre-rag` next to it and re-run `install_hooks.sh` — it re-chains on every run |
+| `path_filter` silently stops narrowing on a big repo | The `$in` pushdown exceeded its cap and fell back to post-filtering | The header says which; the pool auto-compensates by the filter's selectivity, but raising `RAG_PUSHDOWN_MAX_PATHS` is the real fix |
 
 ## Tuning
 
@@ -2794,6 +2857,8 @@ answers better.
 | Prose questions under-ranked | Raise `RAG_W_NL_DENSE`, lower `RAG_W_NL_LEX` |
 | Flatter, rank-only fusion | Set every `RAG_W_*` to `1.0` and `RAG_SYMBOL_BOOST=0` — that is textbook RRF |
 | `find_symbol_or_keyword` times out | Raise `RAG_GREP_TIMEOUT` (default 30s), or install ripgrep |
+| Big repo, `path_filter` results look thin | Check the search header: `N files POST-filtered` means the filter exceeded `RAG_PUSHDOWN_MAX_PATHS` (default 10,000). Raise it — measured safe to ~32,000 before SQLite's variable limit |
+| Large index, relevant chunk never surfaces | The candidate pool may be too shallow. Raise `RAG_POOL_MAX` (default 500); the header prints the pool actually used |
 | Huge first ingest killed at 30 min | Raise `RAG_REINDEX_TIMEOUT` |
 
 ## Rebuild from scratch
@@ -2828,6 +2893,8 @@ lists its wins teaches you to cargo-cult it.
 | Hook chaining | Husky, pre-commit and lefthook all own `.git/hooks` or redirect it via `core.hooksPath`. Overwriting them breaks a developer's commit pipeline in a way that is near-impossible to trace back to a RAG installer. |
 | Broadened fallback symbol regex | The window splitter runs exactly where tree-sitter could not — which is where a name matters most, because there is no node to ask. Six JS/Python keywords left Go/Rust/Kotlin/Swift gap chunks anonymous and unreachable by symbol. |
 | Typed `Optional[...]` signatures | `path_filter: str = None` is a lie the schema generator faithfully transcribes; strict MCP hosts warn on it. |
+| Path-filter pushdown cap raised 400 → 10,000 | The old cap was set by assumption, not measurement. On this stack Chroma resolves a `$in` of 400 values in 0.008s, 10,000 in 0.013s and 32,000 in 0.034s, failing only past ~40,000 on SQLite's variable limit. Every filter between 400 files and the real ceiling was silently falling back to post-filtering — on exactly the repos big enough for the pushdown to matter. |
+| Corpus-scaled candidate pool | `n_results = top_k * 4` is a fixed slice of a growing haystack: 40 candidates is 2% of a 2k-chunk index but 0.06% of a 64k-chunk one, and RRF can only rank what retrieval returned. The pool now follows √(corpus), and over-fetches by the inverse of filter selectivity when the pushdown could not be used. Normalised so a 2k-chunk index gets exactly the old numbers. |
 
 ### Declined, and what would reverse that
 
@@ -2855,6 +2922,25 @@ Uniformity here would be a regression measured in wrong symbol names.
 
 > **Revisit when** the grammars fix those cases upstream — verify by diffing the symbol
 > column of `rag_status()`-scale output before and after, not by reading release notes.
+
+### On tuning constants by measurement, not intuition
+
+Two of the adopted changes above are single numbers that had been wrong since the
+first draft — a `400` and a `* 4` — and neither was wrong because the reasoning was
+bad. They were wrong because nobody measured the thing they were guarding. The
+pushdown cap was ~80x more conservative than the engine needs, and a deeper candidate
+pool turns out to be almost free:
+
+| `n_results` | dense query |
+|---|---|
+| 40 | 9.0 ms |
+| 226 | 5.4 ms |
+| 500 | 10.3 ms |
+| 1000 | 18.3 ms |
+
+If a constant in this system guards a resource, measure that resource before you
+trust the constant. A magic number with a confident comment above it is still a
+magic number.
 
 ### Verifying a change to any of this
 

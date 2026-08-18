@@ -72,6 +72,11 @@ Register with any MCP client as a stdio server:
 | `RAG_W_IDENT_DENSE` / `RAG_W_IDENT_LEX` | `0.7` / `1.4` | Fusion weights for identifier-shaped queries. |
 | `RAG_W_NL_DENSE` / `RAG_W_NL_LEX` | `1.3` / `0.8` | Fusion weights for natural-language queries. |
 | `RAG_W_MIX_DENSE` / `RAG_W_MIX_LEX` | `1.0` / `1.0` | Fusion weights for everything else. |
+| `RAG_PUSHDOWN_MAX_PATHS` | `10000` | Largest `$in` path filter pushed into Chroma. Measured safe to ~32,000; above the cap the query post-filters and the pool compensates. |
+| `RAG_POOL_PER_RESULT` | `4` | Candidates per requested result, unfiltered, at the reference corpus size. |
+| `RAG_POOL_PER_RESULT_FILTERED` | `10` | Same, for a path-filtered query. |
+| `RAG_POOL_REFERENCE_CHUNKS` | `2000` | Corpus size at which those multipliers apply exactly; the pool grows with √(chunks) beyond it. |
+| `RAG_POOL_MAX` | `500` | Hard ceiling on the candidate pool. |
 | `RAG_GREP_TIMEOUT` | `30` | Seconds before the live grep gives up. |
 | `RAG_REINDEX_TIMEOUT` | `1800` | Seconds before `reindex()` gives up. |
 
@@ -93,7 +98,15 @@ textbook RRF — useful as a baseline when measuring a retrieval change.
 - **Asymmetric query embedding.** The bge/e5/arctic instruction prefix is
   applied to queries only, as those models were trained.
 - **Filters are pushed down** into ChromaDB and BM25 rather than applied to the
-  result list, so a narrow `path_filter` can never starve a query.
+  result list, so a narrow `path_filter` can never starve a query. The cap on
+  that pushdown is set from measurement (Chroma resolves a 32,000-value `$in`
+  in 34 ms), not from a guess — and when a filter does exceed it, the search
+  header says `POST-filtered` rather than degrading in silence.
+- **The candidate pool follows corpus size.** A fixed `top_k * 4` is 2% of a
+  2k-chunk index and 0.06% of a 64k-chunk one; RRF can only rank what
+  retrieval handed it. The pool scales with √(chunks) and, when a path filter
+  could not be pushed down, by the inverse of its selectivity. At 2,000 chunks
+  it returns exactly the historical values, so small repos are unaffected.
 - **Fusion knows what kind of question it was asked.** RRF alone treats rank 1
   from either retriever as identical evidence. A bare identifier that BM25
   matched exactly is stronger evidence than a middling vector neighbour, and a
