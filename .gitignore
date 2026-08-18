@@ -1,0 +1,24 @@
+# --- Generated index artifacts -------------------------------------------
+# These embed VERBATIM SOURCE TEXT of whatever repository you indexed.
+# Committing them publishes that code. They rebuild in one command; never
+# commit them, not even "just this once" on a private fork.
+rag-workspace/rag_index.pkl
+rag-workspace/rag_index.pkl.tmp
+rag-workspace/bm25_index.pkl
+rag-workspace/chroma_db/
+rag-workspace/rag.log
+
+# --- Local environment (large, machine-specific, regenerable) -------------
+rag-workspace/.poc-venv/
+rag-workspace/.models_cache/
+rag-workspace/__pycache__/
+rag-workspace/:memory:*
+__pycache__/
+*.py[cod]
+
+# --- Assistant / editor / OS ----------------------------------------------
+.claude/settings.local.json
+.mcp.json
+.DS_Store
+.idea/
+.vscode/

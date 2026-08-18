@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Install git hooks that keep the RAG index fresh after pull / commit /
+# branch switch.
+#
+# Safe to re-run, and safe to run in a repo that already has hooks. Husky,
+# pre-commit and lefthook all manage .git/hooks (or redirect it via
+# core.hooksPath) and silently overwriting their files breaks a developer's
+# commit pipeline in a way that is very hard to trace back to a RAG installer.
+# So: honour core.hooksPath, and where a foreign hook already exists, CHAIN it
+# rather than replace it -- the existing hook keeps running, ours runs after,
+# and its exit status can never fail the git operation.
+set -euo pipefail
+
+RAG_WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(git -C "$RAG_WORKSPACE" rev-parse --show-toplevel 2>/dev/null || dirname "$RAG_WORKSPACE")"
+MARKER="rag-reindex.sh"
+
+# core.hooksPath wins over .git/hooks whenever it is set (this is exactly what
+# husky does), so writing to .git/hooks there would install files git ignores.
+HOOKS_PATH="$(git -C "$REPO_ROOT" config --get core.hooksPath 2>/dev/null || true)"
+if [ -n "${RAG_GIT_DIR:-}" ]; then
+  HOOK_DIR="$RAG_GIT_DIR/hooks"
+elif [ -n "$HOOKS_PATH" ]; then
+  case "$HOOKS_PATH" in
+    /*) HOOK_DIR="$HOOKS_PATH" ;;
+    *)  HOOK_DIR="$REPO_ROOT/$HOOKS_PATH" ;;
+  esac
+  echo "Note: core.hooksPath is set -> installing into $HOOK_DIR"
+else
+  GIT_DIR="$(git -C "$REPO_ROOT" rev-parse --git-dir 2>/dev/null || echo "$REPO_ROOT/.git")"
+  case "$GIT_DIR" in
+    /*) HOOK_DIR="$GIT_DIR/hooks" ;;
+    *)  HOOK_DIR="$REPO_ROOT/$GIT_DIR/hooks" ;;
+  esac
+fi
+
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "Not a git repository at $REPO_ROOT — set RAG_GIT_DIR or run inside the repo." >&2
+  exit 1
+fi
+mkdir -p "$HOOK_DIR"
+
+for hook in post-merge post-commit post-checkout post-rewrite; do
+  target="$HOOK_DIR/$hook"
+  chained=""
+
+  # Snapshot a foreign hook exactly once. On every later run the marker is
+  # present, so this branch is skipped -- which is why the chain is rebuilt
+  # from the saved file below rather than from this check. Getting that wrong
+  # silently drops the user's original hook on the SECOND install, not the first.
+  if [ -e "$target" ] && ! grep -q "$MARKER" "$target" 2>/dev/null; then
+    if [ ! -e "$target.pre-rag" ]; then
+      cp "$target" "$target.pre-rag"
+      chmod +x "$target.pre-rag" 2>/dev/null || true
+    fi
+    echo "Chained existing $hook -> $hook.pre-rag (it still runs first)"
+  fi
+  # Re-assert the chain on every run, whoever wrote the current hook file.
+  [ -e "$target.pre-rag" ] && chained="$target.pre-rag"
+
+  {
+    echo '#!/usr/bin/env bash'
+    echo "# Installed by rag-workspace/install_hooks.sh — keeps the RAG index fresh."
+    if [ -n "$chained" ]; then
+      echo "# A pre-existing $hook was found and is chained below, unmodified."
+      echo "if [ -x \"$chained\" ]; then \"$chained\" \"\$@\" || exit \$?; fi"
+    fi
+    # Never let indexing fail the git operation the user actually asked for.
+    echo "\"$RAG_WORKSPACE/hooks/rag-reindex.sh\" || true"
+    echo "exit 0"
+  } > "$target"
+  chmod +x "$target"
+  echo "Installed $hook"
+done
+
+echo "Done. The index now refreshes automatically after pull, commit, checkout and rebase."
