@@ -702,6 +702,11 @@ def rag_status() -> str:
                   if cfg.RERANKER_MODEL else "off (set RAG_RERANKER to enable)")),
         "Index load      : restricted unpickler (allowlisted classes only)",
     ]
+    heads = meta.get("git_heads") or {}
+    if heads:
+        lines.append("Repos indexed   : %d" % len(heads))
+        for name, head in sorted(heads.items()):
+            lines.append("   %-24s %s" % (name, head[:12]))
     if fresh["changed_count"] or fresh["missing_count"]:
         lines.append("STALE           : %d changed, %d deleted since ingest -- %s"
                      % (fresh["changed_count"], fresh["missing_count"],

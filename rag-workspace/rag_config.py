@@ -12,6 +12,7 @@ Cursor, Windsurf, Continue, or any other stdio MCP host).
 """
 import glob
 import os
+import sys
 import pickle
 import re
 import subprocess
@@ -41,6 +42,62 @@ def _detect_repo_root() -> str:
 
 
 REPO_ROOT = _detect_repo_root()
+
+
+# ---------------------------------------------------------------------------
+# Repository discovery (one index, several checkouts)
+# ---------------------------------------------------------------------------
+# A working setup is often several sibling repos under one directory rather
+# than a single tree. The index does not care -- it walks paths -- but every
+# git-aware operation does: pulling, hook installation and commit recording all
+# have to happen once PER REPO or they silently cover only one of them.
+#
+# Order of precedence: RAG_REPOS (explicit, ':' or newline separated) > the
+# root itself if it is a repo, plus any direct children that are their own
+# repos. Shell scripts read this list via `python3 rag_config.py --repos` so
+# there is exactly one definition of "which repos are in play".
+def _is_git_repo(path: str) -> bool:
+    """True only if `path` is a repo ROOT -- not a subdirectory of one, and
+    not a stray `.git` directory left behind by a mis-aimed installer."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        return False
+    top = out.decode().strip()
+    return bool(top) and os.path.realpath(top) == os.path.realpath(path)
+
+
+def discover_repos(root: str = None) -> list:
+    root = os.path.abspath(root or REPO_ROOT)
+    env = os.environ.get("RAG_REPOS", "").strip()
+    if env:
+        out = []
+        for part in re.split(r"[:\n]", env):
+            part = part.strip()
+            if not part:
+                continue
+            path = part if os.path.isabs(part) else os.path.join(root, part)
+            path = os.path.abspath(os.path.expanduser(path))
+            if os.path.isdir(path) and path not in out:
+                out.append(path)
+        return out
+
+    repos = []
+    if _is_git_repo(root):
+        repos.append(root)
+    try:
+        children = sorted(os.listdir(root))
+    except OSError:
+        children = []
+    for name in children:
+        if name.startswith(".") or name in EXCLUDE_DIRS:
+            continue
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and _is_git_repo(path) and path not in repos:
+            repos.append(path)
+    return repos
 INDEX_DIR = os.path.abspath(os.environ.get("RAG_INDEX_DIR", BASE_DIR))
 CACHE_DIR = os.path.join(INDEX_DIR, ".models_cache")
 CHROMA_DIR = os.path.join(INDEX_DIR, "chroma_db")
@@ -415,3 +472,14 @@ RERANK_CANDIDATES = int(os.environ.get("RAG_RERANK_CANDIDATES", "24"))
 # as it takes. Both are env-tunable because "large repo" has no fixed meaning.
 GREP_TIMEOUT = int(os.environ.get("RAG_GREP_TIMEOUT", "30"))
 REINDEX_TIMEOUT = int(os.environ.get("RAG_REINDEX_TIMEOUT", "1800"))
+
+
+if __name__ == "__main__":
+    # Minimal CLI so the shell scripts share this module's definitions instead
+    # of re-implementing repo discovery in bash and drifting from it.
+    if "--repos" in sys.argv:
+        print("\n".join(discover_repos()))
+    elif "--repo-root" in sys.argv:
+        print(REPO_ROOT)
+    else:
+        print("usage: rag_config.py [--repos | --repo-root]")

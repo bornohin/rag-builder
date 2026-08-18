@@ -183,6 +183,7 @@ Cursor, Windsurf, Continue, or any other stdio MCP host).
 """
 import glob
 import os
+import sys
 import pickle
 import re
 import subprocess
@@ -212,6 +213,62 @@ def _detect_repo_root() -> str:
 
 
 REPO_ROOT = _detect_repo_root()
+
+
+# ---------------------------------------------------------------------------
+# Repository discovery (one index, several checkouts)
+# ---------------------------------------------------------------------------
+# A working setup is often several sibling repos under one directory rather
+# than a single tree. The index does not care -- it walks paths -- but every
+# git-aware operation does: pulling, hook installation and commit recording all
+# have to happen once PER REPO or they silently cover only one of them.
+#
+# Order of precedence: RAG_REPOS (explicit, ':' or newline separated) > the
+# root itself if it is a repo, plus any direct children that are their own
+# repos. Shell scripts read this list via `python3 rag_config.py --repos` so
+# there is exactly one definition of "which repos are in play".
+def _is_git_repo(path: str) -> bool:
+    """True only if `path` is a repo ROOT -- not a subdirectory of one, and
+    not a stray `.git` directory left behind by a mis-aimed installer."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        return False
+    top = out.decode().strip()
+    return bool(top) and os.path.realpath(top) == os.path.realpath(path)
+
+
+def discover_repos(root: str = None) -> list:
+    root = os.path.abspath(root or REPO_ROOT)
+    env = os.environ.get("RAG_REPOS", "").strip()
+    if env:
+        out = []
+        for part in re.split(r"[:\n]", env):
+            part = part.strip()
+            if not part:
+                continue
+            path = part if os.path.isabs(part) else os.path.join(root, part)
+            path = os.path.abspath(os.path.expanduser(path))
+            if os.path.isdir(path) and path not in out:
+                out.append(path)
+        return out
+
+    repos = []
+    if _is_git_repo(root):
+        repos.append(root)
+    try:
+        children = sorted(os.listdir(root))
+    except OSError:
+        children = []
+    for name in children:
+        if name.startswith(".") or name in EXCLUDE_DIRS:
+            continue
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and _is_git_repo(path) and path not in repos:
+            repos.append(path)
+    return repos
 INDEX_DIR = os.path.abspath(os.environ.get("RAG_INDEX_DIR", BASE_DIR))
 CACHE_DIR = os.path.join(INDEX_DIR, ".models_cache")
 CHROMA_DIR = os.path.join(INDEX_DIR, "chroma_db")
@@ -586,6 +643,17 @@ RERANK_CANDIDATES = int(os.environ.get("RAG_RERANK_CANDIDATES", "24"))
 # as it takes. Both are env-tunable because "large repo" has no fixed meaning.
 GREP_TIMEOUT = int(os.environ.get("RAG_GREP_TIMEOUT", "30"))
 REINDEX_TIMEOUT = int(os.environ.get("RAG_REINDEX_TIMEOUT", "1800"))
+
+
+if __name__ == "__main__":
+    # Minimal CLI so the shell scripts share this module's definitions instead
+    # of re-implementing repo discovery in bash and drifting from it.
+    if "--repos" in sys.argv:
+        print("\n".join(discover_repos()))
+    elif "--repo-root" in sys.argv:
+        print(REPO_ROOT)
+    else:
+        print("usage: rag_config.py [--repos | --repo-root]")
 ```
 
 **Why the tokenizer matters.** With the naive `text.lower().split()` that most tutorials
@@ -1327,6 +1395,22 @@ def git_head(repo_root):
         return ""
 
 
+def git_heads(repo_root):
+    """Commit per repo in the workspace, so 'is my index current?' is answerable.
+
+    A single `git_head` is meaningless when the root is a container of several
+    checkouts -- it reports either nothing or one arbitrary repo, while four
+    others drift unnoticed.
+    """
+    heads = {}
+    for repo in cfg.discover_repos(repo_root):
+        head = git_head(repo)
+        if head:
+            rel = os.path.relpath(repo, repo_root).replace(os.sep, "/")
+            heads[rel if rel != "." else os.path.basename(repo)] = head
+    return heads
+
+
 def iter_source_files(repo_root):
     for root, dirs, files in os.walk(repo_root):
         dirs[:] = [d for d in dirs if d not in cfg.EXCLUDE_DIRS and not d.startswith(".git")]
@@ -1570,6 +1654,7 @@ def ingest(repo_root, full=False):
             "repo_root": repo_root,
             "built_at": time.time(),
             "git_head": git_head(repo_root),
+            "git_heads": git_heads(repo_root),
             "chunk_count": len(chunks),
             "file_count": len(manifest),
             "tree_sitter": chunker.TREE_SITTER_AVAILABLE,
@@ -2344,6 +2429,11 @@ def rag_status() -> str:
                   if cfg.RERANKER_MODEL else "off (set RAG_RERANKER to enable)")),
         "Index load      : restricted unpickler (allowlisted classes only)",
     ]
+    heads = meta.get("git_heads") or {}
+    if heads:
+        lines.append("Repos indexed   : %d" % len(heads))
+        for name, head in sorted(heads.items()):
+            lines.append("   %-24s %s" % (name, head[:12]))
     if fresh["changed_count"] or fresh["missing_count"]:
         lines.append("STALE           : %d changed, %d deleted since ingest -- %s"
                      % (fresh["changed_count"], fresh["missing_count"],
@@ -2502,15 +2592,23 @@ Write `<WORKSPACE>/hooks/rag-reindex.sh`:
 #!/usr/bin/env bash
 # Shared body for the git hooks that keep the RAG index in step with the tree.
 # Incremental: only files whose SHA-1 changed are re-chunked and re-embedded.
+#
+# Targets the WORKSPACE root, not the repo this hook fired in. That distinction
+# is the whole ballgame in a multi-repo setup: `git rev-parse --show-toplevel`
+# from inside a hook returns the single repo being committed to, and indexing
+# that alone silently DELETES every other repo's chunks from the shared index.
+# rag_config owns the definition of the root, so ask it.
 set -u
 RAG_WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="$RAG_WORKSPACE/.poc-venv/bin/python3"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
 [ -n "$PYTHON" ] || exit 0
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$RAG_WORKSPACE/..")"
+REPO_ROOT="$("$PYTHON" "$RAG_WORKSPACE/rag_config.py" --repo-root 2>/dev/null || true)"
+[ -n "$REPO_ROOT" ] || REPO_ROOT="$(cd "$RAG_WORKSPACE/.." && pwd)"
+
 echo "[RAG] incremental re-index of $REPO_ROOT"
-"$PYTHON" "$RAG_WORKSPACE/ingest_codebase.py" --target "$REPO_ROOT" 2>&1 | tail -4
+"$PYTHON" "$RAG_WORKSPACE/ingest_codebase.py" --target "$REPO_ROOT" 2>&1 | tail -3
 exit 0
 ```
 
@@ -2531,8 +2629,26 @@ Write `<WORKSPACE>/install_hooks.sh`:
 set -euo pipefail
 
 RAG_WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(git -C "$RAG_WORKSPACE" rev-parse --show-toplevel 2>/dev/null || dirname "$RAG_WORKSPACE")"
 MARKER="rag-reindex.sh"
+
+PYTHON="$RAG_WORKSPACE/.poc-venv/bin/python3"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
+REPO_ROOT="$("$PYTHON" "$RAG_WORKSPACE/rag_config.py" --repo-root 2>/dev/null || dirname "$RAG_WORKSPACE")"
+
+# A workspace is often several sibling checkouts, not one tree. Installing into
+# only the first would leave the others pulling with no re-index and no warning
+# -- stale results that look perfectly healthy. So install into every repo the
+# same discovery logic the indexer and the sync script use.
+REPOS="$("$PYTHON" "$RAG_WORKSPACE/rag_config.py" --repos 2>/dev/null || true)"
+[ $# -gt 0 ] && REPOS="$(printf '%s\n' "$@")"
+if [ -z "${REPOS//[[:space:]]/}" ]; then
+  echo "No git repository found under $REPO_ROOT." >&2
+  echo "Pass repo paths explicitly, or set RAG_REPOS." >&2
+  exit 1
+fi
+
+install_into() {
+  local REPO_ROOT="$1"
 
 # core.hooksPath wins over .git/hooks whenever it is set (this is exactly what
 # husky does), so writing to .git/hooks there would install files git ignores.
@@ -2554,11 +2670,13 @@ else
 fi
 
 if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "Not a git repository at $REPO_ROOT — set RAG_GIT_DIR or run inside the repo." >&2
-  exit 1
+  echo "  $(basename "$REPO_ROOT"): not a git repository — skipped" >&2
+  return 0
 fi
 mkdir -p "$HOOK_DIR"
+echo "  $(basename "$REPO_ROOT"):"
 
+installed=""
 for hook in post-merge post-commit post-checkout post-rewrite; do
   target="$HOOK_DIR/$hook"
   chained=""
@@ -2572,7 +2690,7 @@ for hook in post-merge post-commit post-checkout post-rewrite; do
       cp "$target" "$target.pre-rag"
       chmod +x "$target.pre-rag" 2>/dev/null || true
     fi
-    echo "Chained existing $hook -> $hook.pre-rag (it still runs first)"
+    echo "    chained existing $hook -> $hook.pre-rag (it still runs first)"
   fi
   # Re-assert the chain on every run, whoever wrote the current hook file.
   [ -e "$target.pre-rag" ] && chained="$target.pre-rag"
@@ -2589,10 +2707,19 @@ for hook in post-merge post-commit post-checkout post-rewrite; do
     echo "exit 0"
   } > "$target"
   chmod +x "$target"
-  echo "Installed $hook"
+  installed="$installed $hook"
 done
+echo "    installed:$installed"
+}
 
-echo "Done. The index now refreshes automatically after pull, commit, checkout and rebase."
+echo "Installing RAG hooks into:"
+while IFS= read -r repo; do
+  [ -n "${repo//[[:space:]]/}" ] && install_into "$repo"
+done <<< "$REPOS"
+
+echo
+echo "Done. Every repo above re-indexes the shared index after pull, commit,"
+echo "checkout and rebase. For the manual path, use: $RAG_WORKSPACE/sync_and_index.sh"
 ```
 
 ```bash
@@ -2614,21 +2741,30 @@ Write `<WORKSPACE>/sync_and_index.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# Refresh the working tree and the RAG index at the start of an agent session.
+# Pull every repo in the workspace, then refresh the RAG index once.
 #
-# Client-agnostic: call it from a Claude Code SessionStart hook, a Gemini/Cursor
-# equivalent, a shell alias, or by hand. Designed to be safe enough to run
-# unattended and fast enough to block a session start on:
+# Built for the normal working pattern: pull everything before you start, work
+# for a while, pull again tomorrow. Run it by hand, from a shell alias, or from
+# an agent's session-start hook -- it is the same command either way.
 #
-#   * never touches a dirty working tree (your uncommitted work is untouchable)
-#   * fast-forward only -- never creates a merge commit, never rewrites history
-#   * skips the pull on a detached HEAD or a branch with no upstream
-#   * short network timeout, and every failure is non-fatal
-#   * re-indexes incrementally (~1s when nothing changed)
+# Handles SEVERAL repos, which is the whole point. A setup of five sibling
+# checkouts under one directory has five places to pull from but ONE index; a
+# single-repo script silently refreshes one of them and leaves you searching
+# four stale trees with no indication anything is wrong.
+#
+# Safe enough to run unattended:
+#   * never touches a dirty working tree -- uncommitted work is untouchable
+#   * fast-forward only: never a merge commit, never a rewrite
+#   * skips a detached HEAD or a branch with no upstream
+#   * bounded network wait per repo; every failure is non-fatal and reported
+#   * indexes incrementally, so only what actually changed is re-embedded
+#
+# Usage:  sync_and_index.sh [--full] [--no-pull] [--no-index] [--quiet]
 #
 # Env:
-#   RAG_SKIP_PULL=1     refresh the index but do not touch git
-#   RAG_FETCH_TIMEOUT   seconds to allow for the network fetch (default 20)
+#   RAG_REPOS          ':'-separated repo list (default: auto-discovered)
+#   RAG_SKIP_PULL=1    same as --no-pull
+#   RAG_FETCH_TIMEOUT  seconds allowed for each fetch (default 20)
 set -u
 
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2636,53 +2772,106 @@ PYTHON="$WORKSPACE/.poc-venv/bin/python3"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
 [ -n "$PYTHON" ] || { echo "[RAG] no python3 available; skipping"; exit 0; }
 
-REPO_ROOT="$(git -C "$WORKSPACE" rev-parse --show-toplevel 2>/dev/null || dirname "$WORKSPACE")"
+FULL=""; DO_PULL=1; DO_INDEX=1; QUIET=0
+for arg in "$@"; do
+  case "$arg" in
+    --full)     FULL="--full" ;;
+    --no-pull)  DO_PULL=0 ;;
+    --no-index) DO_INDEX=0 ;;
+    --quiet|-q) QUIET=1 ;;
+    -h|--help)  sed -n '2,28p' "$0"; exit 0 ;;
+    *) echo "[RAG] unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+[ "${RAG_SKIP_PULL:-0}" = "1" ] && DO_PULL=0
+
+REPO_ROOT="$("$PYTHON" "$WORKSPACE/rag_config.py" --repo-root 2>/dev/null || dirname "$WORKSPACE")"
 FETCH_TIMEOUT="${RAG_FETCH_TIMEOUT:-20}"
 
-pull_latest() {
-  [ "${RAG_SKIP_PULL:-0}" = "1" ] && { echo "[RAG] pull skipped (RAG_SKIP_PULL=1)"; return; }
-  git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || { echo "[RAG] not a git repo; skipping pull"; return; }
+say() { [ "$QUIET" = "1" ] || echo "$@"; }
 
-  local branch upstream
-  branch="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || true)"
-  if [ -z "$branch" ]; then
-    echo "[RAG] detached HEAD; skipping pull"; return
-  fi
-  upstream="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
-  if [ -z "$upstream" ]; then
-    echo "[RAG] '$branch' has no upstream; skipping pull"; return
-  fi
-  if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
-    echo "[RAG] working tree has uncommitted changes; skipping pull (run 'git pull' yourself when ready)"
+# One repo. Echoes a single status word plus detail; never exits non-zero.
+sync_one() {
+  local repo="$1" name branch upstream behind before after changed
+  name="$(basename "$repo")"
+
+  if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+    printf '  %-22s %-12s %s\n' "$name" "skipped" "uncommitted changes — pull it yourself when ready"
     return
   fi
+  branch="$(git -C "$repo" symbolic-ref --short -q HEAD || true)"
+  if [ -z "$branch" ]; then
+    printf '  %-22s %-12s %s\n' "$name" "skipped" "detached HEAD"; return
+  fi
+  upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  if [ -z "$upstream" ]; then
+    printf '  %-22s %-12s %s\n' "$name" "skipped" "'$branch' has no upstream"; return
+  fi
 
-  # Portable timeout: background the fetch and kill it if it overruns.
-  git -C "$REPO_ROOT" fetch --quiet --prune 2>/dev/null &
-  local fetch_pid=$! waited=0
-  while kill -0 "$fetch_pid" 2>/dev/null; do
-    [ "$waited" -ge "$FETCH_TIMEOUT" ] && { kill "$fetch_pid" 2>/dev/null; echo "[RAG] fetch timed out after ${FETCH_TIMEOUT}s"; return; }
+  # Portable bounded fetch: background it and kill it if it overruns.
+  git -C "$repo" fetch --quiet --prune 2>/dev/null &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$FETCH_TIMEOUT" ]; then
+      kill "$pid" 2>/dev/null
+      printf '  %-22s %-12s %s\n' "$name" "offline" "fetch exceeded ${FETCH_TIMEOUT}s"; return
+    fi
     sleep 1; waited=$((waited + 1))
   done
-  wait "$fetch_pid" 2>/dev/null || { echo "[RAG] fetch failed (offline?); continuing"; return; }
-
-  local behind
-  behind="$(git -C "$REPO_ROOT" rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)"
-  if [ "$behind" = "0" ]; then
-    echo "[RAG] already up to date with $upstream"
-    return
+  if ! wait "$pid" 2>/dev/null; then
+    printf '  %-22s %-12s %s\n' "$name" "offline" "fetch failed; kept local state"; return
   fi
-  if git -C "$REPO_ROOT" merge --ff-only "$upstream" --quiet 2>/dev/null; then
-    echo "[RAG] fast-forwarded $branch by $behind commit(s) from $upstream"
+
+  behind="$(git -C "$repo" rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)"
+  if [ "$behind" = "0" ]; then
+    printf '  %-22s %-12s %s\n' "$name" "up to date" "$branch"; return
+  fi
+
+  before="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
+  if git -C "$repo" merge --ff-only "$upstream" --quiet 2>/dev/null; then
+    after="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
+    changed="$(git -C "$repo" diff --name-only "$before..$after" 2>/dev/null | wc -l | tr -d ' ')"
+    printf '  %-22s %-12s %s\n' "$name" "PULLED" \
+      "$behind commit(s), $changed file(s) changed on $branch"
+    echo "$repo" >> "$PULLED_LIST"
   else
-    echo "[RAG] cannot fast-forward $branch (diverged from $upstream) -- resolve manually"
+    printf '  %-22s %-12s %s\n' "$name" "DIVERGED" \
+      "cannot fast-forward $branch from $upstream — resolve manually"
   fi
 }
 
-pull_latest
-# The git hooks also fire on a successful merge; this run is idempotent and
-# becomes a ~1s no-op when the hook already did the work.
-"$PYTHON" "$WORKSPACE/ingest_codebase.py" --target "$REPO_ROOT" 2>&1 | tail -3
+PULLED_LIST="$(mktemp)"; trap 'rm -f "$PULLED_LIST"' EXIT
+
+REPOS="$("$PYTHON" "$WORKSPACE/rag_config.py" --repos 2>/dev/null)"
+NREPOS=0; [ -n "$REPOS" ] && NREPOS="$(printf '%s\n' "$REPOS" | wc -l | tr -d ' ')"
+
+if [ "$DO_PULL" = "1" ]; then
+  if [ "$NREPOS" = "0" ]; then
+    say "[RAG] no git repositories found under $REPO_ROOT — indexing the tree as-is"
+  else
+    say "[RAG] syncing $NREPOS repo(s) under $REPO_ROOT"
+    while IFS= read -r repo; do [ -n "$repo" ] && sync_one "$repo"; done <<< "$REPOS"
+  fi
+else
+  say "[RAG] pull skipped"
+fi
+
+NPULLED=0; [ -s "$PULLED_LIST" ] && NPULLED="$(wc -l < "$PULLED_LIST" | tr -d ' ')"
+
+if [ "$DO_INDEX" = "0" ]; then
+  say "[RAG] indexing skipped (--no-index)"
+  exit 0
+fi
+
+# Always index, even when nothing was pulled: your own uncommitted edits also
+# make the index stale, and an incremental run over an unchanged tree is a
+# sub-second no-op. The ingest itself is the cheapest honest staleness check.
+if [ "$NPULLED" != "0" ]; then
+  say "[RAG] $NPULLED repo(s) changed — re-indexing"
+else
+  say "[RAG] no remote changes — verifying the index is current"
+fi
+"$PYTHON" "$WORKSPACE/ingest_codebase.py" --target "$REPO_ROOT" $FULL 2>&1 | tail -3
 ```
 
 ```bash
@@ -2943,6 +3132,8 @@ answers better.
 | `rag_status` says "estimated (tokenizer not cached)" | `tokenizer.json` missing from `.models_cache` | Re-run `download_model.py`; chunking still works but over-splits conservatively |
 | Reranker line says "set but unavailable" | `RAG_RERANKER` names a model that was never cached | `RAG_RERANKER=... python3 download_model.py` while online, or unset it |
 | Ingest crashed and the next run re-embedded everything | An older build, or a checkpoint rejected as incompatible | The log says which. A checkpoint is only reused for the same model, chunker version and repo root — resuming across any of those would mix incompatible vectors |
+| Chunks from other repos vanish after a commit | An old `rag-reindex.sh` targeting the committed repo instead of the workspace root | Re-run `install_hooks.sh`, then `sync_and_index.sh --full`. `rag_status()` should list every repo under "Repos indexed" |
+| One repo never refreshes | Hooks installed before multi-repo support, or the repo is outside the discovered set | `rag_config.py --repos` shows what is discovered; set `RAG_REPOS` and re-run `install_hooks.sh` |
 | A pre-existing git hook stopped running | It was replaced by an older installer version | Look for `<hook>.pre-rag` next to it and re-run `install_hooks.sh` — it re-chains on every run |
 | `path_filter` silently stops narrowing on a big repo | The `$in` pushdown exceeded its cap and fell back to post-filtering | The header says which; the pool auto-compensates by the filter's selectivity, but raising `RAG_PUSHDOWN_MAX_PATHS` is the real fix |
 
@@ -2954,6 +3145,7 @@ answers better.
 | Better recall, more RAM/time | `RAG_EMBED_MODEL=BAAI/bge-base-en-v1.5` (768-dim); a full rebuild is forced automatically |
 | Multilingual codebase or docs | A multilingual fastembed model; the query-prefix table in `rag_config.py` adapts |
 | Prose-heavy docs repo | Raise `RAG_MAX_CHUNK_TOKENS` toward the model window, keeping headroom |
+| Several repos under one root | Nothing — they are auto-discovered. Override with `RAG_REPOS` if they live elsewhere, and use `sync_and_index.sh` to pull them all before a session |
 | Monorepo, one sub-project at a time | Set `RAG_REPO_ROOT` per client entry with separate `RAG_INDEX_DIR`s |
 | Top-3 precision matters more than latency | `RAG_RERANKER=Xenova/ms-marco-MiniLM-L-6-v2`, then re-run `download_model.py` to cache it |
 | Reranker too slow / too shallow | `RAG_RERANK_CANDIDATES` (default 24) — the fused pool it re-scores |
@@ -2999,6 +3191,7 @@ lists its wins teaches you to cargo-cult it.
 | Broadened fallback symbol regex | The window splitter runs exactly where tree-sitter could not — which is where a name matters most, because there is no node to ask. Six JS/Python keywords left Go/Rust/Kotlin/Swift gap chunks anonymous and unreachable by symbol. |
 | Typed `Optional[...]` signatures | `path_filter: str = None` is a lie the schema generator faithfully transcribes; strict MCP hosts warn on it. |
 | Path-filter pushdown cap raised 400 → 10,000 | The old cap was set by assumption, not measurement. On this stack Chroma resolves a `$in` of 400 values in 0.008s, 10,000 in 0.013s and 32,000 in 0.034s, failing only past ~40,000 on SQLite's variable limit. Every filter between 400 files and the real ceiling was silently falling back to post-filtering — on exactly the repos big enough for the pushdown to matter. |
+| Multi-repo workspace support | A workspace is frequently several sibling checkouts, not one tree. The indexer only walks paths and never cared — but every git-aware operation does, and each failed differently: `install_hooks.sh` covered only the first repo, so the rest pulled with no re-index and no warning; and the hook body targeted `git rev-parse --show-toplevel`, which inside a hook is the *one* repo being committed to — re-indexing that alone **deletes every other repo's chunks** from the shared index. Repo discovery now lives in `rag_config` and is shared by the indexer, the hooks and the sync script, and `rag_status()` prints the indexed commit per repo. |
 | Ingest checkpointing | Embeddings were already durable per batch, but the record of *which* ones existed was written once at the very end. A crash therefore left a vector store the next run could not explain, and the "counts disagree → rebuild" rule wiped it and started over. Irrelevant at 133 s; at a 50–70 min cold ingest it is an afternoon. The checkpoint stores manifest + embedded ids only — not chunk bodies — so a write costs well under a second, and resume is gated on the file's SHA-1 so an edit between crash and restart is re-embedded rather than trusted. |
 | Corpus-scaled candidate pool | `n_results = top_k * 4` is a fixed slice of a growing haystack: 40 candidates is 2% of a 2k-chunk index but 0.06% of a 64k-chunk one, and RRF can only rank what retrieval returned. The pool now follows √(corpus), and over-fetches by the inverse of filter selectivity when the pushdown could not be used. Normalised so a 2k-chunk index gets exactly the old numbers. |
 

@@ -38,6 +38,22 @@ def git_head(repo_root):
         return ""
 
 
+def git_heads(repo_root):
+    """Commit per repo in the workspace, so 'is my index current?' is answerable.
+
+    A single `git_head` is meaningless when the root is a container of several
+    checkouts -- it reports either nothing or one arbitrary repo, while four
+    others drift unnoticed.
+    """
+    heads = {}
+    for repo in cfg.discover_repos(repo_root):
+        head = git_head(repo)
+        if head:
+            rel = os.path.relpath(repo, repo_root).replace(os.sep, "/")
+            heads[rel if rel != "." else os.path.basename(repo)] = head
+    return heads
+
+
 def iter_source_files(repo_root):
     for root, dirs, files in os.walk(repo_root):
         dirs[:] = [d for d in dirs if d not in cfg.EXCLUDE_DIRS and not d.startswith(".git")]
@@ -281,6 +297,7 @@ def ingest(repo_root, full=False):
             "repo_root": repo_root,
             "built_at": time.time(),
             "git_head": git_head(repo_root),
+            "git_heads": git_heads(repo_root),
             "chunk_count": len(chunks),
             "file_count": len(manifest),
             "tree_sitter": chunker.TREE_SITTER_AVAILABLE,

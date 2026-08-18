@@ -12,8 +12,26 @@
 set -euo pipefail
 
 RAG_WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(git -C "$RAG_WORKSPACE" rev-parse --show-toplevel 2>/dev/null || dirname "$RAG_WORKSPACE")"
 MARKER="rag-reindex.sh"
+
+PYTHON="$RAG_WORKSPACE/.poc-venv/bin/python3"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
+REPO_ROOT="$("$PYTHON" "$RAG_WORKSPACE/rag_config.py" --repo-root 2>/dev/null || dirname "$RAG_WORKSPACE")"
+
+# A workspace is often several sibling checkouts, not one tree. Installing into
+# only the first would leave the others pulling with no re-index and no warning
+# -- stale results that look perfectly healthy. So install into every repo the
+# same discovery logic the indexer and the sync script use.
+REPOS="$("$PYTHON" "$RAG_WORKSPACE/rag_config.py" --repos 2>/dev/null || true)"
+[ $# -gt 0 ] && REPOS="$(printf '%s\n' "$@")"
+if [ -z "${REPOS//[[:space:]]/}" ]; then
+  echo "No git repository found under $REPO_ROOT." >&2
+  echo "Pass repo paths explicitly, or set RAG_REPOS." >&2
+  exit 1
+fi
+
+install_into() {
+  local REPO_ROOT="$1"
 
 # core.hooksPath wins over .git/hooks whenever it is set (this is exactly what
 # husky does), so writing to .git/hooks there would install files git ignores.
@@ -35,11 +53,13 @@ else
 fi
 
 if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "Not a git repository at $REPO_ROOT — set RAG_GIT_DIR or run inside the repo." >&2
-  exit 1
+  echo "  $(basename "$REPO_ROOT"): not a git repository — skipped" >&2
+  return 0
 fi
 mkdir -p "$HOOK_DIR"
+echo "  $(basename "$REPO_ROOT"):"
 
+installed=""
 for hook in post-merge post-commit post-checkout post-rewrite; do
   target="$HOOK_DIR/$hook"
   chained=""
@@ -53,7 +73,7 @@ for hook in post-merge post-commit post-checkout post-rewrite; do
       cp "$target" "$target.pre-rag"
       chmod +x "$target.pre-rag" 2>/dev/null || true
     fi
-    echo "Chained existing $hook -> $hook.pre-rag (it still runs first)"
+    echo "    chained existing $hook -> $hook.pre-rag (it still runs first)"
   fi
   # Re-assert the chain on every run, whoever wrote the current hook file.
   [ -e "$target.pre-rag" ] && chained="$target.pre-rag"
@@ -70,7 +90,16 @@ for hook in post-merge post-commit post-checkout post-rewrite; do
     echo "exit 0"
   } > "$target"
   chmod +x "$target"
-  echo "Installed $hook"
+  installed="$installed $hook"
 done
+echo "    installed:$installed"
+}
 
-echo "Done. The index now refreshes automatically after pull, commit, checkout and rebase."
+echo "Installing RAG hooks into:"
+while IFS= read -r repo; do
+  [ -n "${repo//[[:space:]]/}" ] && install_into "$repo"
+done <<< "$REPOS"
+
+echo
+echo "Done. Every repo above re-indexes the shared index after pull, commit,"
+echo "checkout and rebase. For the manual path, use: $RAG_WORKSPACE/sync_and_index.sh"

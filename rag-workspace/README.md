@@ -16,7 +16,8 @@ configuration.
 | `ingest_codebase.py` | Incremental indexer (SHA-1 manifest) → ChromaDB + BM25 → `rag_index.pkl`. |
 | `mcp_server.py` | FastMCP stdio server exposing the 7 tools. |
 | `download_model.py` | One-time model cache warm-up (embedder, tokenizer, and the optional reranker). |
-| `install_hooks.sh` | Installs git hooks that re-index after pull/commit/checkout/rebase, chaining any hooks already present. |
+| `install_hooks.sh` | Installs git hooks into **every** repo in the workspace, chaining any hooks already present. |
+| `sync_and_index.sh` | Manual sync: pulls every repo, then refreshes the index once. The command to run before you start work. |
 
 ## Setup
 
@@ -25,8 +26,17 @@ python3 -m venv rag-workspace/.poc-venv
 rag-workspace/.poc-venv/bin/pip install -r rag-workspace/requirements.txt
 rag-workspace/.poc-venv/bin/python3 rag-workspace/download_model.py
 rag-workspace/.poc-venv/bin/python3 rag-workspace/ingest_codebase.py --full
-rag-workspace/install_hooks.sh
+rag-workspace/install_hooks.sh          # optional; covers every repo found
 ```
+
+Day to day, one command pulls every repo and refreshes the index:
+
+```bash
+rag-workspace/sync_and_index.sh          # --full, --no-pull, --no-index, --quiet
+```
+
+It fast-forwards each repo (skipping any with uncommitted work), then indexes
+once — incrementally, so only what actually changed is re-embedded.
 
 Register with any MCP client as a stdio server:
 
@@ -59,7 +69,8 @@ Register with any MCP client as a stdio server:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `RAG_REPO_ROOT` | enclosing git worktree | Index a different repository. |
+| `RAG_REPO_ROOT` | enclosing git worktree | Index a different repository (or a directory containing several). |
+| `RAG_REPOS` | auto-discovered | `:`-separated repo list for pulls and hook installation. Defaults to the root itself plus any direct children that are their own git repos. |
 | `RAG_INDEX_DIR` | `rag-workspace/` | Where the index artifacts live. |
 | `RAG_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Any fastembed-supported model (query prefix adapts automatically). |
 | `RAG_MAX_CHUNK_TOKENS` | `440` | Chunk budget; keep below the model's window. |
@@ -131,6 +142,14 @@ textbook RRF — useful as a baseline when measuring a retrieval change.
   sub-second). Resume is gated on each file's SHA-1: anything edited between
   the crash and the restart is re-embedded rather than trusted, and vectors
   the new plan no longer contains are deleted as orphans.
+- **Several repos, one index.** A workspace is often sibling checkouts rather
+  than one tree. The indexer only walks paths and never cared, but every
+  git-aware operation does, so pulls, hook installation and commit recording
+  all iterate over the discovered repo list. Two traps this closes: hooks
+  installed into only the first repo leave the rest pulling with no re-index
+  and no warning; and a hook that re-indexes the repo it fired in — rather
+  than the workspace root — silently deletes every other repo's chunks.
+  `rag_status()` prints the indexed commit per repo so drift is visible.
 - **Staleness is surfaced, never hidden.** Every result carries a warning when
   indexed files have changed on disk, and negative answers are confirmed
   against a live grep.
