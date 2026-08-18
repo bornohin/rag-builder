@@ -69,6 +69,56 @@ def load_index():
         return {"chunks": {}, "manifest": {}, "meta": {}}
 
 
+def write_checkpoint(manifest, embedded_ids, repo_root):
+    """Record which chunks are already in the vector store.
+
+    Deliberately does NOT store chunk bodies: re-chunking on resume is seconds,
+    while writing every body at each checkpoint would cost more than the crash
+    it protects against. Manifest + embedded ids is all a resume needs.
+    """
+    payload = {
+        "manifest": manifest,
+        "embedded": list(embedded_ids),
+        "meta": {"model": cfg.MODEL_NAME, "chunker_version": chunker.VERSION,
+                 "repo_root": repo_root, "at": time.time()},
+    }
+    tmp = cfg.CHECKPOINT_PATH + ".tmp"
+    with open(tmp, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, cfg.CHECKPOINT_PATH)      # atomic: never a half-written record
+
+
+def read_checkpoint(repo_root):
+    """A usable checkpoint for THIS config, or None.
+
+    Rejects a checkpoint written under a different model, chunker or repo --
+    resuming across any of those would mix incompatible vectors, which is worse
+    than the hour it saves.
+    """
+    if not os.path.exists(cfg.CHECKPOINT_PATH):
+        return None
+    try:
+        data = cfg.load_pickle_safe(cfg.CHECKPOINT_PATH)
+    except Exception as exc:
+        log("Checkpoint unreadable (%s); ignoring it." % exc)
+        return None
+    meta = (data or {}).get("meta", {})
+    if (meta.get("model") != cfg.MODEL_NAME
+            or meta.get("chunker_version") != chunker.VERSION
+            or meta.get("repo_root") != repo_root):
+        log("Checkpoint is from a different model/chunker/repo; ignoring it.")
+        return None
+    return data
+
+
+def clear_checkpoint():
+    for path in (cfg.CHECKPOINT_PATH, cfg.CHECKPOINT_PATH + ".tmp"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def ingest(repo_root, full=False):
     started = time.time()
     log("Repository : %s" % repo_root)
@@ -92,10 +142,22 @@ def ingest(repo_root, full=False):
     client = chromadb.PersistentClient(path=cfg.CHROMA_DIR)
     collection = client.get_or_create_collection(name=cfg.COLLECTION_NAME)
 
+    checkpoint = None if full else read_checkpoint(repo_root)
+
     if not full and prev_chunks and collection.count() != len(prev_chunks):
-        log("Vector store (%d) and index (%d) disagree -> full rebuild."
-            % (collection.count(), len(prev_chunks)))
-        full, prev_chunks, prev_manifest = True, {}, {}
+        # A count mismatch normally means an index/store divergence we cannot
+        # reason about, so the safe move is to rebuild. But an interrupted
+        # ingest produces exactly this symptom by design -- extra vectors the
+        # old index has never heard of -- and there a rebuild throws away the
+        # very work the checkpoint exists to preserve.
+        if checkpoint:
+            log("Vector store (%d) and index (%d) disagree, but a checkpoint from "
+                "an interrupted ingest explains it -- resuming."
+                % (collection.count(), len(prev_chunks)))
+        else:
+            log("Vector store (%d) and index (%d) disagree -> full rebuild."
+                % (collection.count(), len(prev_chunks)))
+            full, prev_chunks, prev_manifest = True, {}, {}
 
     if full:
         existing = collection.get(include=[])["ids"]
@@ -143,6 +205,25 @@ def ingest(repo_root, full=False):
     for rel in removed_files:
         stale_ids.extend(prev_manifest[rel]["ids"])
 
+    # ---- resume ----------------------------------------------------------
+    already_embedded = set()
+    if checkpoint:
+        ck_manifest = checkpoint.get("manifest", {})
+        ck_embedded = set(checkpoint.get("embedded", []))
+        for rel, record in manifest.items():
+            prev = ck_manifest.get(rel)
+            # Only trust the checkpoint for files that have not moved since.
+            # Chunk ids encode line numbers, so an unchanged SHA-1 guarantees
+            # the ids AND the text behind them are identical.
+            if prev and prev.get("sha") == record["sha"]:
+                already_embedded.update(cid for cid in record["ids"] if cid in ck_embedded)
+        # Anything the interrupted run embedded that the current plan no longer
+        # contains (a file edited between the crash and now) is an orphan vector.
+        stale_ids.extend(ck_embedded - set(chunks))
+        if already_embedded:
+            log("Resuming interrupted ingest: %d chunk(s) already embedded, skipping them."
+                % len(already_embedded))
+
     log("Files: %d unchanged, %d re-chunked, %d removed" %
         (reused_files, changed_files, len(removed_files)))
     log("Chunks: %d total (%d new)" % (len(chunks), len(new_chunk_ids)))
@@ -158,13 +239,15 @@ def ingest(repo_root, full=False):
             collection.delete(ids=stale_ids[i:i + 5000])
         log("Deleted %d stale vectors." % len(stale_ids))
 
-    if new_chunk_ids:
+    pending = [cid for cid in new_chunk_ids if cid not in already_embedded]
+    if pending:
         from fastembed import TextEmbedding
         model = TextEmbedding(model_name=cfg.MODEL_NAME, cache_dir=cfg.CACHE_DIR)
-        log("Embedding %d chunks..." % len(new_chunk_ids))
+        log("Embedding %d chunks..." % len(pending))
         batch = cfg.EMBED_BATCH_SIZE
-        for i in range(0, len(new_chunk_ids), batch):
-            window = new_chunk_ids[i:i + batch]
+        embedded = set(already_embedded)
+        for n, i in enumerate(range(0, len(pending), batch), start=1):
+            window = pending[i:i + batch]
             texts = [chunks[cid]["text"] for cid in window]
             vectors = [v.tolist() for v in model.embed(texts)]
             collection.upsert(
@@ -172,7 +255,12 @@ def ingest(repo_root, full=False):
                 embeddings=vectors,
                 metadatas=[chunks[cid]["metadata"] for cid in window],
             )
-            log("  %d/%d" % (min(i + batch, len(new_chunk_ids)), len(new_chunk_ids)))
+            embedded.update(window)
+            log("  %d/%d" % (min(i + batch, len(pending)), len(pending)))
+            # The vectors are already durable; this makes the fact of them so.
+            if n % cfg.CHECKPOINT_EVERY_BATCHES == 0 and i + batch < len(pending):
+                write_checkpoint(manifest, embedded, repo_root)
+                log("  [checkpoint] %d embedded so far" % len(embedded))
 
     # ---- lexical index ----------------------------------------------------
     log("Building BM25 index with the code-aware tokenizer...")
@@ -202,6 +290,7 @@ def ingest(repo_root, full=False):
     with open(tmp, "wb") as fh:
         pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, cfg.INDEX_PATH)      # atomic: the server never sees a half file
+    clear_checkpoint()                   # the index now supersedes any progress record
 
     if os.path.exists(cfg.LEGACY_BM25_PATH):
         os.remove(cfg.LEGACY_BM25_PATH)

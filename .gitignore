@@ -4,6 +4,8 @@
 # commit them, not even "just this once" on a private fork.
 rag-workspace/rag_index.pkl
 rag-workspace/rag_index.pkl.tmp
+rag-workspace/rag_index.pkl.ckpt
+rag-workspace/rag_index.pkl.ckpt.tmp
 rag-workspace/bm25_index.pkl
 rag-workspace/chroma_db/
 rag-workspace/rag.log

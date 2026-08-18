@@ -46,6 +46,9 @@ CACHE_DIR = os.path.join(INDEX_DIR, ".models_cache")
 CHROMA_DIR = os.path.join(INDEX_DIR, "chroma_db")
 INDEX_PATH = os.path.join(INDEX_DIR, "rag_index.pkl")      # chunks + bm25 + manifest
 LEGACY_BM25_PATH = os.path.join(INDEX_DIR, "bm25_index.pkl")
+# Progress record for an interrupted ingest. Deleted on clean completion, so
+# its mere existence means "the last run did not finish".
+CHECKPOINT_PATH = os.path.join(INDEX_DIR, "rag_index.pkl.ckpt")
 LOG_PATH = os.path.join(INDEX_DIR, "rag.log")
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "codebase")
 
@@ -80,6 +83,12 @@ def query_prefix(model_name: str = MODEL_NAME) -> str:
 MODEL_MAX_TOKENS = int(os.environ.get("RAG_MODEL_MAX_TOKENS", "512"))
 MAX_CHUNK_TOKENS = int(os.environ.get("RAG_MAX_CHUNK_TOKENS", "440"))
 EMBED_BATCH_SIZE = int(os.environ.get("RAG_EMBED_BATCH", "256"))
+# Write the progress record every N embed batches. Embeddings already land in
+# the vector store batch by batch; what used to be lost on a crash was the
+# BOOKKEEPING that says which ones exist -- so the next run wiped them and
+# started over. At the default batch size this checkpoints every ~5k chunks,
+# which costs well under a second and bounds re-work to a few minutes.
+CHECKPOINT_EVERY_BATCHES = int(os.environ.get("RAG_CHECKPOINT_EVERY", "20"))
 
 # ---------------------------------------------------------------------------
 # Token counting
@@ -320,13 +329,18 @@ class RestrictedUnpickler(pickle.Unpickler):
 EMPTY_INDEX = {"chunks": {}, "manifest": {}, "meta": {}, "bm25": None, "bm25_ids": []}
 
 
+def load_pickle_safe(path: str) -> dict:
+    """Unpickle a RAG artifact through the allowlist. Raises on anything else."""
+    with open(path, "rb") as fh:
+        return RestrictedUnpickler(fh).load()
+
+
 def load_index_file(path: str = None) -> dict:
     """Load the index through the restricted unpickler. Never raises."""
     path = path or INDEX_PATH
     if not os.path.exists(path):
         return dict(EMPTY_INDEX)
-    with open(path, "rb") as fh:
-        data = RestrictedUnpickler(fh).load()
+    data = load_pickle_safe(path)
     if not isinstance(data, dict):
         raise ValueError("index is not a dict (got %s)" % type(data).__name__)
     for key, default in EMPTY_INDEX.items():

@@ -217,6 +217,9 @@ CACHE_DIR = os.path.join(INDEX_DIR, ".models_cache")
 CHROMA_DIR = os.path.join(INDEX_DIR, "chroma_db")
 INDEX_PATH = os.path.join(INDEX_DIR, "rag_index.pkl")      # chunks + bm25 + manifest
 LEGACY_BM25_PATH = os.path.join(INDEX_DIR, "bm25_index.pkl")
+# Progress record for an interrupted ingest. Deleted on clean completion, so
+# its mere existence means "the last run did not finish".
+CHECKPOINT_PATH = os.path.join(INDEX_DIR, "rag_index.pkl.ckpt")
 LOG_PATH = os.path.join(INDEX_DIR, "rag.log")
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "codebase")
 
@@ -251,6 +254,12 @@ def query_prefix(model_name: str = MODEL_NAME) -> str:
 MODEL_MAX_TOKENS = int(os.environ.get("RAG_MODEL_MAX_TOKENS", "512"))
 MAX_CHUNK_TOKENS = int(os.environ.get("RAG_MAX_CHUNK_TOKENS", "440"))
 EMBED_BATCH_SIZE = int(os.environ.get("RAG_EMBED_BATCH", "256"))
+# Write the progress record every N embed batches. Embeddings already land in
+# the vector store batch by batch; what used to be lost on a crash was the
+# BOOKKEEPING that says which ones exist -- so the next run wiped them and
+# started over. At the default batch size this checkpoints every ~5k chunks,
+# which costs well under a second and bounds re-work to a few minutes.
+CHECKPOINT_EVERY_BATCHES = int(os.environ.get("RAG_CHECKPOINT_EVERY", "20"))
 
 # ---------------------------------------------------------------------------
 # Token counting
@@ -491,13 +500,18 @@ class RestrictedUnpickler(pickle.Unpickler):
 EMPTY_INDEX = {"chunks": {}, "manifest": {}, "meta": {}, "bm25": None, "bm25_ids": []}
 
 
+def load_pickle_safe(path: str) -> dict:
+    """Unpickle a RAG artifact through the allowlist. Raises on anything else."""
+    with open(path, "rb") as fh:
+        return RestrictedUnpickler(fh).load()
+
+
 def load_index_file(path: str = None) -> dict:
     """Load the index through the restricted unpickler. Never raises."""
     path = path or INDEX_PATH
     if not os.path.exists(path):
         return dict(EMPTY_INDEX)
-    with open(path, "rb") as fh:
-        data = RestrictedUnpickler(fh).load()
+    data = load_pickle_safe(path)
     if not isinstance(data, dict):
         raise ValueError("index is not a dict (got %s)" % type(data).__name__)
     for key, default in EMPTY_INDEX.items():
@@ -1344,6 +1358,56 @@ def load_index():
         return {"chunks": {}, "manifest": {}, "meta": {}}
 
 
+def write_checkpoint(manifest, embedded_ids, repo_root):
+    """Record which chunks are already in the vector store.
+
+    Deliberately does NOT store chunk bodies: re-chunking on resume is seconds,
+    while writing every body at each checkpoint would cost more than the crash
+    it protects against. Manifest + embedded ids is all a resume needs.
+    """
+    payload = {
+        "manifest": manifest,
+        "embedded": list(embedded_ids),
+        "meta": {"model": cfg.MODEL_NAME, "chunker_version": chunker.VERSION,
+                 "repo_root": repo_root, "at": time.time()},
+    }
+    tmp = cfg.CHECKPOINT_PATH + ".tmp"
+    with open(tmp, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, cfg.CHECKPOINT_PATH)      # atomic: never a half-written record
+
+
+def read_checkpoint(repo_root):
+    """A usable checkpoint for THIS config, or None.
+
+    Rejects a checkpoint written under a different model, chunker or repo --
+    resuming across any of those would mix incompatible vectors, which is worse
+    than the hour it saves.
+    """
+    if not os.path.exists(cfg.CHECKPOINT_PATH):
+        return None
+    try:
+        data = cfg.load_pickle_safe(cfg.CHECKPOINT_PATH)
+    except Exception as exc:
+        log("Checkpoint unreadable (%s); ignoring it." % exc)
+        return None
+    meta = (data or {}).get("meta", {})
+    if (meta.get("model") != cfg.MODEL_NAME
+            or meta.get("chunker_version") != chunker.VERSION
+            or meta.get("repo_root") != repo_root):
+        log("Checkpoint is from a different model/chunker/repo; ignoring it.")
+        return None
+    return data
+
+
+def clear_checkpoint():
+    for path in (cfg.CHECKPOINT_PATH, cfg.CHECKPOINT_PATH + ".tmp"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def ingest(repo_root, full=False):
     started = time.time()
     log("Repository : %s" % repo_root)
@@ -1367,10 +1431,22 @@ def ingest(repo_root, full=False):
     client = chromadb.PersistentClient(path=cfg.CHROMA_DIR)
     collection = client.get_or_create_collection(name=cfg.COLLECTION_NAME)
 
+    checkpoint = None if full else read_checkpoint(repo_root)
+
     if not full and prev_chunks and collection.count() != len(prev_chunks):
-        log("Vector store (%d) and index (%d) disagree -> full rebuild."
-            % (collection.count(), len(prev_chunks)))
-        full, prev_chunks, prev_manifest = True, {}, {}
+        # A count mismatch normally means an index/store divergence we cannot
+        # reason about, so the safe move is to rebuild. But an interrupted
+        # ingest produces exactly this symptom by design -- extra vectors the
+        # old index has never heard of -- and there a rebuild throws away the
+        # very work the checkpoint exists to preserve.
+        if checkpoint:
+            log("Vector store (%d) and index (%d) disagree, but a checkpoint from "
+                "an interrupted ingest explains it -- resuming."
+                % (collection.count(), len(prev_chunks)))
+        else:
+            log("Vector store (%d) and index (%d) disagree -> full rebuild."
+                % (collection.count(), len(prev_chunks)))
+            full, prev_chunks, prev_manifest = True, {}, {}
 
     if full:
         existing = collection.get(include=[])["ids"]
@@ -1418,6 +1494,25 @@ def ingest(repo_root, full=False):
     for rel in removed_files:
         stale_ids.extend(prev_manifest[rel]["ids"])
 
+    # ---- resume ----------------------------------------------------------
+    already_embedded = set()
+    if checkpoint:
+        ck_manifest = checkpoint.get("manifest", {})
+        ck_embedded = set(checkpoint.get("embedded", []))
+        for rel, record in manifest.items():
+            prev = ck_manifest.get(rel)
+            # Only trust the checkpoint for files that have not moved since.
+            # Chunk ids encode line numbers, so an unchanged SHA-1 guarantees
+            # the ids AND the text behind them are identical.
+            if prev and prev.get("sha") == record["sha"]:
+                already_embedded.update(cid for cid in record["ids"] if cid in ck_embedded)
+        # Anything the interrupted run embedded that the current plan no longer
+        # contains (a file edited between the crash and now) is an orphan vector.
+        stale_ids.extend(ck_embedded - set(chunks))
+        if already_embedded:
+            log("Resuming interrupted ingest: %d chunk(s) already embedded, skipping them."
+                % len(already_embedded))
+
     log("Files: %d unchanged, %d re-chunked, %d removed" %
         (reused_files, changed_files, len(removed_files)))
     log("Chunks: %d total (%d new)" % (len(chunks), len(new_chunk_ids)))
@@ -1433,13 +1528,15 @@ def ingest(repo_root, full=False):
             collection.delete(ids=stale_ids[i:i + 5000])
         log("Deleted %d stale vectors." % len(stale_ids))
 
-    if new_chunk_ids:
+    pending = [cid for cid in new_chunk_ids if cid not in already_embedded]
+    if pending:
         from fastembed import TextEmbedding
         model = TextEmbedding(model_name=cfg.MODEL_NAME, cache_dir=cfg.CACHE_DIR)
-        log("Embedding %d chunks..." % len(new_chunk_ids))
+        log("Embedding %d chunks..." % len(pending))
         batch = cfg.EMBED_BATCH_SIZE
-        for i in range(0, len(new_chunk_ids), batch):
-            window = new_chunk_ids[i:i + batch]
+        embedded = set(already_embedded)
+        for n, i in enumerate(range(0, len(pending), batch), start=1):
+            window = pending[i:i + batch]
             texts = [chunks[cid]["text"] for cid in window]
             vectors = [v.tolist() for v in model.embed(texts)]
             collection.upsert(
@@ -1447,7 +1544,12 @@ def ingest(repo_root, full=False):
                 embeddings=vectors,
                 metadatas=[chunks[cid]["metadata"] for cid in window],
             )
-            log("  %d/%d" % (min(i + batch, len(new_chunk_ids)), len(new_chunk_ids)))
+            embedded.update(window)
+            log("  %d/%d" % (min(i + batch, len(pending)), len(pending)))
+            # The vectors are already durable; this makes the fact of them so.
+            if n % cfg.CHECKPOINT_EVERY_BATCHES == 0 and i + batch < len(pending):
+                write_checkpoint(manifest, embedded, repo_root)
+                log("  [checkpoint] %d embedded so far" % len(embedded))
 
     # ---- lexical index ----------------------------------------------------
     log("Building BM25 index with the code-aware tokenizer...")
@@ -1477,6 +1579,7 @@ def ingest(repo_root, full=False):
     with open(tmp, "wb") as fh:
         pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, cfg.INDEX_PATH)      # atomic: the server never sees a half file
+    clear_checkpoint()                   # the index now supersedes any progress record
 
     if os.path.exists(cfg.LEGACY_BM25_PATH):
         os.remove(cfg.LEGACY_BM25_PATH)
@@ -2839,6 +2942,7 @@ answers better.
 | `refusing to unpickle X.Y from the RAG index` | The index was written by a different/older build, or tampered with | Delete `rag_index.pkl` and ingest `--full`. If the class is legitimate, add it to `_PICKLE_ALLOWLIST` — never widen it to `builtins.eval`/`os.system` |
 | `rag_status` says "estimated (tokenizer not cached)" | `tokenizer.json` missing from `.models_cache` | Re-run `download_model.py`; chunking still works but over-splits conservatively |
 | Reranker line says "set but unavailable" | `RAG_RERANKER` names a model that was never cached | `RAG_RERANKER=... python3 download_model.py` while online, or unset it |
+| Ingest crashed and the next run re-embedded everything | An older build, or a checkpoint rejected as incompatible | The log says which. A checkpoint is only reused for the same model, chunker version and repo root — resuming across any of those would mix incompatible vectors |
 | A pre-existing git hook stopped running | It was replaced by an older installer version | Look for `<hook>.pre-rag` next to it and re-run `install_hooks.sh` — it re-chains on every run |
 | `path_filter` silently stops narrowing on a big repo | The `$in` pushdown exceeded its cap and fell back to post-filtering | The header says which; the pool auto-compensates by the filter's selectivity, but raising `RAG_PUSHDOWN_MAX_PATHS` is the real fix |
 
@@ -2860,6 +2964,7 @@ answers better.
 | Big repo, `path_filter` results look thin | Check the search header: `N files POST-filtered` means the filter exceeded `RAG_PUSHDOWN_MAX_PATHS` (default 10,000). Raise it — measured safe to ~32,000 before SQLite's variable limit |
 | Large index, relevant chunk never surfaces | The candidate pool may be too shallow. Raise `RAG_POOL_MAX` (default 500); the header prints the pool actually used |
 | Huge first ingest killed at 30 min | Raise `RAG_REINDEX_TIMEOUT` |
+| Long cold ingest, want tighter crash protection | Lower `RAG_CHECKPOINT_EVERY` (default 20 batches ≈ 5k chunks); each checkpoint costs well under a second |
 
 ## Rebuild from scratch
 
@@ -2894,6 +2999,7 @@ lists its wins teaches you to cargo-cult it.
 | Broadened fallback symbol regex | The window splitter runs exactly where tree-sitter could not — which is where a name matters most, because there is no node to ask. Six JS/Python keywords left Go/Rust/Kotlin/Swift gap chunks anonymous and unreachable by symbol. |
 | Typed `Optional[...]` signatures | `path_filter: str = None` is a lie the schema generator faithfully transcribes; strict MCP hosts warn on it. |
 | Path-filter pushdown cap raised 400 → 10,000 | The old cap was set by assumption, not measurement. On this stack Chroma resolves a `$in` of 400 values in 0.008s, 10,000 in 0.013s and 32,000 in 0.034s, failing only past ~40,000 on SQLite's variable limit. Every filter between 400 files and the real ceiling was silently falling back to post-filtering — on exactly the repos big enough for the pushdown to matter. |
+| Ingest checkpointing | Embeddings were already durable per batch, but the record of *which* ones existed was written once at the very end. A crash therefore left a vector store the next run could not explain, and the "counts disagree → rebuild" rule wiped it and started over. Irrelevant at 133 s; at a 50–70 min cold ingest it is an afternoon. The checkpoint stores manifest + embedded ids only — not chunk bodies — so a write costs well under a second, and resume is gated on the file's SHA-1 so an edit between crash and restart is re-embedded rather than trusted. |
 | Corpus-scaled candidate pool | `n_results = top_k * 4` is a fixed slice of a growing haystack: 40 candidates is 2% of a 2k-chunk index but 0.06% of a 64k-chunk one, and RRF can only rank what retrieval returned. The pool now follows √(corpus), and over-fetches by the inverse of filter selectivity when the pushdown could not be used. Normalised so a 2k-chunk index gets exactly the old numbers. |
 
 ### Declined, and what would reverse that

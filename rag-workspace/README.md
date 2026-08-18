@@ -77,6 +77,7 @@ Register with any MCP client as a stdio server:
 | `RAG_POOL_PER_RESULT_FILTERED` | `10` | Same, for a path-filtered query. |
 | `RAG_POOL_REFERENCE_CHUNKS` | `2000` | Corpus size at which those multipliers apply exactly; the pool grows with √(chunks) beyond it. |
 | `RAG_POOL_MAX` | `500` | Hard ceiling on the candidate pool. |
+| `RAG_CHECKPOINT_EVERY` | `20` | Embed batches between ingest checkpoints. Lower it for tighter crash protection on very long ingests. |
 | `RAG_GREP_TIMEOUT` | `30` | Seconds before the live grep gives up. |
 | `RAG_REINDEX_TIMEOUT` | `1800` | Seconds before `reindex()` gives up. |
 
@@ -122,6 +123,14 @@ textbook RRF — useful as a baseline when measuring a retrieval change.
   is how husky redirects hooks), any pre-existing hook is preserved as
   `<hook>.pre-rag` and still runs first, and indexing can never fail the git
   operation the user actually asked for.
+- **A crashed ingest resumes; it does not start over.** Vectors were always
+  written batch by batch, but the record of which ones existed was written
+  once at the end — so a crash left a store the next run could not explain,
+  and the consistency check wiped it. Progress is now checkpointed during the
+  embed loop (manifest + embedded ids, never chunk bodies, so a write is
+  sub-second). Resume is gated on each file's SHA-1: anything edited between
+  the crash and the restart is re-embedded rather than trusted, and vectors
+  the new plan no longer contains are deleted as orphans.
 - **Staleness is surfaced, never hidden.** Every result carries a warning when
   indexed files have changed on disk, and negative answers are confirmed
   against a live grep.
