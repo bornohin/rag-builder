@@ -1,0 +1,942 @@
+<title>Local Hybrid Retrieval</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  /* ---- tokens: complete light palette on bare :root ---------------------- */
+  :root {
+    --ground:   #F4F6F5;
+    --surface:  #FFFFFF;
+    --sunken:   #EAEEEC;
+    --ink:      #12181B;
+    --muted:    #5C6B70;
+    --faint:    #8A989C;
+    --rule:     #D5DEDB;
+    --rule-firm:#B8C5C1;
+
+    /* the two retrieval streams — these carry meaning, not decoration */
+    --dense:    #0F766E;
+    --dense-bg: #E2F0EE;
+    --lex:      #B4530A;
+    --lex-bg:   #F6E9DC;
+
+    --shadow: 0 1px 2px rgba(18,24,27,.05), 0 8px 24px -12px rgba(18,24,27,.18);
+    --maxw: 1120px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:   #0E1315;
+      --surface:  #161D20;
+      --sunken:   #1C2529;
+      --ink:      #E6EDEB;
+      --muted:    #9BADB0;
+      --faint:    #6F8085;
+      --rule:     #263034;
+      --rule-firm:#3A484D;
+      --dense:    #5AD3C6;
+      --dense-bg: #10312F;
+      --lex:      #F0A868;
+      --lex-bg:   #35240F;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:   #0E1315;
+    --surface:  #161D20;
+    --sunken:   #1C2529;
+    --ink:      #E6EDEB;
+    --muted:    #9BADB0;
+    --faint:    #6F8085;
+    --rule:     #263034;
+    --rule-firm:#3A484D;
+    --dense:    #5AD3C6;
+    --dense-bg: #10312F;
+    --lex:      #F0A868;
+    --lex-bg:   #35240F;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---- deck chrome ------------------------------------------------------- */
+  .rail {
+    position: fixed; inset: 0 0 auto 0; z-index: 20;
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px clamp(16px, 4vw, 40px);
+    background: var(--ground);
+    background: color-mix(in srgb, var(--ground) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--rule);
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .rail .mark { color: var(--ink); font-weight: 500; }
+  .rail .spacer { flex: 1; }
+  .progress {
+    position: fixed; top: 0; left: 0; z-index: 21; height: 2px;
+    background: var(--dense); width: 0;
+  }
+  .themer {
+    font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit;
+    background: none; border: 1px solid var(--rule-firm); border-radius: 2px;
+    padding: 3px 9px; cursor: pointer;
+  }
+  .themer:hover { border-color: var(--ink); color: var(--ink); }
+  .themer:focus-visible { outline: 2px solid var(--dense); outline-offset: 2px; }
+
+  /* ---- plates ------------------------------------------------------------ */
+  .deck { scroll-snap-type: y proximity; }
+  .plate {
+    scroll-snap-align: start;
+    min-height: 100svh;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 92px clamp(16px, 4vw, 40px) 56px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .inner { width: 100%; max-width: var(--maxw); margin: 0 auto; }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--faint);
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 18px;
+  }
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+  h1, h2 {
+    font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+    font-weight: 700; letter-spacing: -.025em; text-wrap: balance;
+    margin: 0 0 14px;
+  }
+  h1 { font-size: clamp(38px, 6.4vw, 74px); line-height: 1.02; }
+  h2 { font-size: clamp(26px, 3.6vw, 42px); line-height: 1.1; }
+  h3 {
+    font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+    font-size: 15px; font-weight: 600; letter-spacing: -.01em;
+    margin: 0 0 6px;
+  }
+  .lede { font-size: clamp(16px, 1.5vw, 19px); color: var(--muted); max-width: 66ch; margin: 0 0 30px; }
+  p { max-width: 68ch; }
+  strong { font-weight: 600; }
+
+  code, .mono {
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .9em;
+  }
+  code { background: var(--sunken); padding: .1em .34em; border-radius: 2px; }
+
+  .dense-t { color: var(--dense); }
+  .lex-t   { color: var(--lex); }
+
+  /* ---- building blocks --------------------------------------------------- */
+  .grid { display: grid; gap: 18px; }
+  .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 860px) {
+    .g2, .g3, .g4 { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 18px 20px;
+  }
+  .card p { margin: 0; font-size: 14.5px; color: var(--muted); }
+  .card .tag {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: 10.5px; letter-spacing: .13em; text-transform: uppercase;
+    color: var(--faint); display: block; margin-bottom: 9px;
+  }
+  .card.dense { border-top: 2px solid var(--dense); }
+  .card.lex   { border-top: 2px solid var(--lex); }
+
+  figure { margin: 0 0 8px; }
+  .figwrap { overflow-x: auto; padding-bottom: 4px; }
+  svg.dia { display: block; width: 100%; min-width: 620px; max-width: 100%; height: auto; }
+  figcaption {
+    font-size: 13.5px; color: var(--muted); margin-top: 12px;
+    max-width: 72ch; text-wrap: pretty;
+  }
+
+  /* svg theming — styled from page CSS so both themes resolve from tokens */
+  .d-fill   { fill: var(--surface); }
+  .d-sunk   { fill: var(--sunken); }
+  .d-stroke { stroke: var(--rule-firm); fill: none; stroke-width: 1.25; }
+  .d-line   { stroke: var(--muted); fill: none; stroke-width: 1.25; }
+  .d-tick   { stroke: var(--rule-firm); stroke-width: 2; stroke-linecap: round; }
+  .d-txt    { fill: var(--ink); font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 12.5px; }
+  .d-lbl    { fill: var(--muted); font-family: "IBM Plex Mono", Menlo, monospace; font-size: 10.5px; letter-spacing: .06em; }
+  .d-num    { fill: var(--faint); font-family: "IBM Plex Mono", Menlo, monospace; font-size: 10px; }
+  .d-dense  { stroke: var(--dense); fill: none; stroke-width: 1.5; }
+  .d-dense-f{ fill: var(--dense-bg); stroke: var(--dense); stroke-width: 1.25; }
+  .d-lex    { stroke: var(--lex); fill: none; stroke-width: 1.5; }
+  .d-lex-f  { fill: var(--lex-bg); stroke: var(--lex); stroke-width: 1.25; }
+  .d-dense-t{ fill: var(--dense); font-family: "IBM Plex Mono", Menlo, monospace; font-size: 10.5px; letter-spacing: .06em; }
+  .d-lex-t  { fill: var(--lex); font-family: "IBM Plex Mono", Menlo, monospace; font-size: 10.5px; letter-spacing: .06em; }
+  .d-dash   { stroke-dasharray: 4 3; }
+  .mk-n { fill: var(--muted); }
+  .mk-d { fill: var(--dense); }
+  .mk-l { fill: var(--lex); }
+  .d-emph { stroke-width: 2.25; }
+
+  /* ---- tables ------------------------------------------------------------ */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 14px; }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule); }
+  th {
+    font-family: "IBM Plex Mono", Menlo, monospace;
+    font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--faint); font-weight: 400;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-family: "IBM Plex Mono", Menlo, monospace; font-variant-numeric: tabular-nums; }
+  td.k { font-weight: 500; }
+
+  /* ---- misc -------------------------------------------------------------- */
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+  .steps li { display: grid; grid-template-columns: 30px 1fr; gap: 14px; align-items: start; }
+  .steps .n {
+    font-family: "IBM Plex Mono", Menlo, monospace; font-size: 11px;
+    color: var(--dense); border: 1px solid var(--dense); border-radius: 2px;
+    text-align: center; padding: 3px 0; line-height: 1.2;
+  }
+  .steps p { margin: 3px 0 0; font-size: 14.5px; color: var(--muted); }
+
+  .kv { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+  .kv span {
+    font-family: "IBM Plex Mono", Menlo, monospace; font-size: 11px;
+    letter-spacing: .07em; color: var(--muted);
+    border: 1px solid var(--rule-firm); border-radius: 2px; padding: 5px 10px;
+  }
+
+  .hint {
+    font-family: "IBM Plex Mono", Menlo, monospace;
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--faint); margin-top: 34px;
+  }
+
+  .note {
+    border-left: 2px solid var(--lex);
+    padding: 2px 0 2px 16px; margin-top: 24px;
+    font-size: 14.5px; color: var(--muted); max-width: 68ch;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; transition: none !important; }
+    .deck { scroll-snap-type: none; }
+  }
+  html { scroll-behavior: smooth; }
+</style>
+
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+  <defs>
+    <marker id="ar-n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="mk-n" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+    <marker id="ar-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="mk-d" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+    <marker id="ar-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="mk-l" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+</svg>
+
+<div class="progress" id="bar"></div>
+<header class="rail">
+  <span class="mark">Local Hybrid Retrieval</span>
+  <span class="spacer"></span>
+  <span id="pos">01 / 10</span>
+  <button class="themer" id="themer" type="button">Theme</button>
+</header>
+
+<main class="deck" id="deck">
+
+  <!-- 01 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 01 &nbsp;·&nbsp; The idea</div>
+      <h1>Code search an&nbsp;agent can actually act&nbsp;on.</h1>
+      <p class="lede">
+        A recipe for indexing any codebase so an AI assistant stops guessing and starts
+        citing. Two search engines run side by side, their results are merged, and every
+        answer comes back with an exact file and line range. It all runs on one laptop,
+        with no server and no network.
+      </p>
+      <div class="grid g4">
+        <div class="card">
+          <span class="tag">Input</span>
+          <p>Any repository, any language.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Output</span>
+          <p><code>path/file.ext:120&#8209;168</code> plus the code that lives there.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Runs on</span>
+          <p>CPU only. No GPU, no API key, no daemon.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Talks to</span>
+          <p>Any assistant, over a standard tool protocol.</p>
+        </div>
+      </div>
+      <p class="hint">Scroll, or use &larr; &rarr;</p>
+    </div>
+  </section>
+
+  <!-- 02 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 02 &nbsp;·&nbsp; The problem</div>
+      <h2>Two kinds of search, two kinds of blindness.</h2>
+      <p class="lede">
+        Every code search tool is one of these. Each fails on exactly the questions the
+        other one answers, which is why picking one is the wrong move.
+      </p>
+      <div class="grid g2">
+        <div class="card lex">
+          <span class="tag lex-t">Keyword search &nbsp;/&nbsp; grep</span>
+          <h3>Finds the letters you typed.</h3>
+          <p>
+            Perfect when you know the name. Useless when you don't: ask it
+            &ldquo;how does login work&rdquo; and it looks for files containing the word
+            &ldquo;login&rdquo;. It cannot tell that <code>authenticate()</code> is the answer.
+          </p>
+        </div>
+        <div class="card dense">
+          <span class="tag dense-t">Meaning search &nbsp;/&nbsp; embeddings</span>
+          <h3>Finds things that seem related.</h3>
+          <p>
+            Great at vague questions. Unreliable at precise ones: ask for the exact
+            symbol <code>refresh_token_v2</code> and it may hand you five things that are
+            merely <em>about</em> tokens, and miss the one that is it.
+          </p>
+        </div>
+      </div>
+      <p class="note">
+        So run both, always, and combine the two ranked lists. That single decision is
+        what the rest of this deck is built around.
+      </p>
+    </div>
+  </section>
+
+  <!-- 03 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 03 &nbsp;·&nbsp; The pipeline</div>
+      <h2>From files to a cited answer.</h2>
+      <p class="lede">
+        Five stages. The first three happen once, when you index. The last two happen
+        every time the assistant asks a question.
+      </p>
+
+      <figure>
+        <div class="figwrap">
+          <svg class="dia" viewBox="0 0 1000 320" role="img"
+               aria-label="Source files are split into chunks, then indexed twice in parallel: an embedder writes to a vector index and a tokenizer writes to a keyword index. At query time both indexes return ranked candidates which are merged by a fusion step and served to the assistant as cited results.">
+
+            <!-- indexing band label -->
+            <text class="d-lbl" x="20" y="26">INDEX ONCE</text>
+            <line class="d-stroke d-dash" x1="20" y1="36" x2="560" y2="36"/>
+            <text class="d-lbl" x="596" y="26">ANSWER EVERY QUERY</text>
+            <line class="d-stroke d-dash" x1="596" y1="36" x2="980" y2="36"/>
+
+            <!-- 1 files -->
+            <rect class="d-fill d-stroke" x="20" y="130" width="118" height="60" rx="3"/>
+            <text class="d-txt" x="79" y="156" text-anchor="middle">Source</text>
+            <text class="d-txt" x="79" y="173" text-anchor="middle">files</text>
+            <text class="d-num" x="79" y="206" text-anchor="middle">1</text>
+
+            <!-- 2 chunker -->
+            <rect class="d-fill d-stroke" x="196" y="130" width="118" height="60" rx="3"/>
+            <text class="d-txt" x="255" y="156" text-anchor="middle">Chunker</text>
+            <text class="d-txt" x="255" y="173" text-anchor="middle">by symbol</text>
+            <text class="d-num" x="255" y="206" text-anchor="middle">2</text>
+
+            <line class="d-line" x1="140" y1="160" x2="192" y2="160" marker-end="url(#ar-n)"/>
+            <text class="d-lbl" x="166" y="150" text-anchor="middle">read</text>
+
+            <!-- 3 two indexes -->
+            <rect class="d-dense-f" x="372" y="62" width="150" height="62" rx="3"/>
+            <text class="d-txt" x="447" y="88" text-anchor="middle">Vector index</text>
+            <text class="d-dense-t" x="447" y="106" text-anchor="middle">MEANING</text>
+
+            <rect class="d-lex-f" x="372" y="196" width="150" height="62" rx="3"/>
+            <text class="d-txt" x="447" y="222" text-anchor="middle">Keyword index</text>
+            <text class="d-lex-t" x="447" y="240" text-anchor="middle">EXACT TEXT</text>
+
+            <text class="d-num" x="447" y="166" text-anchor="middle">3</text>
+
+            <path class="d-dense" d="M316,150 C344,150 344,93 368,93" marker-end="url(#ar-d)"/>
+            <text class="d-dense-t" x="344" y="120" text-anchor="middle">embed</text>
+            <path class="d-lex" d="M316,170 C344,170 344,227 368,227" marker-end="url(#ar-l)"/>
+            <text class="d-lex-t" x="344" y="200" text-anchor="middle">tokenize</text>
+
+            <!-- 4 fusion -->
+            <rect class="d-fill d-stroke" x="640" y="130" width="118" height="60" rx="3"/>
+            <text class="d-txt" x="699" y="156" text-anchor="middle">Merge</text>
+            <text class="d-txt" x="699" y="173" text-anchor="middle">the two lists</text>
+            <text class="d-num" x="699" y="206" text-anchor="middle">4</text>
+
+            <path class="d-dense" d="M526,93 C592,93 596,150 636,150" marker-end="url(#ar-d)"/>
+            <text class="d-dense-t" x="576" y="112" text-anchor="middle">top matches</text>
+            <path class="d-lex" d="M526,227 C592,227 596,170 636,170" marker-end="url(#ar-l)"/>
+            <text class="d-lex-t" x="576" y="212" text-anchor="middle">top matches</text>
+
+            <!-- 5 assistant -->
+            <rect class="d-fill d-stroke" x="826" y="130" width="152" height="60" rx="3"/>
+            <text class="d-txt" x="902" y="156" text-anchor="middle">Assistant</text>
+            <text class="d-txt" x="902" y="173" text-anchor="middle">gets results</text>
+            <text class="d-num" x="902" y="206" text-anchor="middle">5</text>
+
+            <line class="d-line" x1="760" y1="160" x2="822" y2="160" marker-end="url(#ar-n)"/>
+            <text class="d-lbl" x="791" y="150" text-anchor="middle">file:lines</text>
+
+            <line class="d-line d-dash" x1="902" y1="196" x2="902" y2="236"/>
+            <line class="d-line d-dash" x1="902" y1="236" x2="79" y2="236"/>
+            <line class="d-line d-dash" x1="79" y1="236" x2="79" y2="200" marker-end="url(#ar-n)"/>
+            <text class="d-lbl" x="490" y="252" text-anchor="middle">code changes &rarr; re-index only what changed</text>
+          </svg>
+        </div>
+        <figcaption>
+          The same chunks feed both indexes, so the two searches always agree on what a
+          &ldquo;result&rdquo; is. The dashed return path is the freshness loop: edits
+          re-enter at stage 1 and only changed files are redone.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 04 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 04 &nbsp;·&nbsp; Stage 2</div>
+      <h2>Cut code where the code cuts.</h2>
+      <p class="lede">
+        Search engines work on chunks. How you cut them decides whether a result is
+        useful. The naive method slices every N lines; the better method uses a real
+        parser and cuts on function and class boundaries.
+      </p>
+
+      <figure>
+        <div class="figwrap">
+          <svg class="dia" viewBox="0 0 900 330" role="img"
+               aria-label="Comparison of two chunking strategies on the same file. Fixed-size windows cut through the middle of a function, splitting its signature from its body. Parser-based chunking aligns every boundary with a whole function, so each chunk is a complete unit with exact start and end lines.">
+
+            <!-- LEFT: fixed windows -->
+            <text class="d-lex-t" x="40" y="34">FIXED WINDOWS &mdash; CUT EVERY N LINES</text>
+            <rect class="d-sunk" x="40" y="52" width="330" height="228" rx="3"/>
+
+            <!-- code lines -->
+            <line class="d-tick" x1="70" y1="72"  x2="250" y2="72"/>
+            <line class="d-tick" x1="70" y1="92"  x2="215" y2="92"/>
+            <line class="d-tick" x1="70" y1="112" x2="290" y2="112"/>
+            <line class="d-tick" x1="86" y1="132" x2="262" y2="132"/>
+            <line class="d-tick" x1="86" y1="152" x2="230" y2="152"/>
+            <line class="d-tick" x1="86" y1="172" x2="275" y2="172"/>
+            <line class="d-tick" x1="86" y1="192" x2="205" y2="192"/>
+            <line class="d-tick" x1="70" y1="212" x2="285" y2="212"/>
+            <line class="d-tick" x1="86" y1="232" x2="240" y2="232"/>
+            <line class="d-tick" x1="86" y1="252" x2="200" y2="252"/>
+
+            <!-- window boundaries -->
+            <rect class="d-stroke" x="58" y="62" width="256" height="80" rx="2"/>
+            <rect class="d-stroke" x="58" y="142" width="256" height="80" rx="2"/>
+            <rect class="d-stroke" x="58" y="222" width="256" height="48" rx="2"/>
+
+            <!-- the damage -->
+            <line class="d-lex d-emph" x1="46" y1="142" x2="326" y2="142"/>
+            <text class="d-lex-t" x="334" y="139">cut</text>
+            <path class="d-lex" d="M300,112 C340,112 344,132 336,138" marker-end="url(#ar-l)"/>
+            <text class="d-lex-t" x="196" y="300" text-anchor="middle">a function is split in half &mdash;</text>
+            <text class="d-lex-t" x="196" y="316" text-anchor="middle">neither piece makes sense alone</text>
+
+            <!-- RIGHT: parser -->
+            <text class="d-dense-t" x="530" y="34">PARSER &mdash; CUT ON REAL BOUNDARIES</text>
+            <rect class="d-sunk" x="530" y="52" width="330" height="228" rx="3"/>
+
+            <line class="d-tick" x1="560" y1="72"  x2="740" y2="72"/>
+            <line class="d-tick" x1="560" y1="92"  x2="705" y2="92"/>
+            <line class="d-tick" x1="560" y1="112" x2="780" y2="112"/>
+            <line class="d-tick" x1="576" y1="132" x2="752" y2="132"/>
+            <line class="d-tick" x1="576" y1="152" x2="720" y2="152"/>
+            <line class="d-tick" x1="576" y1="172" x2="765" y2="172"/>
+            <line class="d-tick" x1="576" y1="192" x2="695" y2="192"/>
+            <line class="d-tick" x1="560" y1="212" x2="775" y2="212"/>
+            <line class="d-tick" x1="576" y1="232" x2="730" y2="232"/>
+            <line class="d-tick" x1="576" y1="252" x2="690" y2="252"/>
+
+            <rect class="d-dense" x="548" y="62" width="256" height="42" rx="2"/>
+            <rect class="d-dense" x="548" y="104" width="256" height="98" rx="2"/>
+            <rect class="d-dense" x="548" y="202" width="256" height="68" rx="2"/>
+
+            <text class="d-lbl" x="816" y="88">imports</text>
+            <text class="d-lbl" x="816" y="157">function</text>
+            <text class="d-lbl" x="816" y="240">function</text>
+
+            <text class="d-dense-t" x="686" y="300" text-anchor="middle">every chunk is one whole thing,</text>
+            <text class="d-dense-t" x="686" y="316" text-anchor="middle">with exact start and end lines</text>
+
+            <line class="d-stroke d-dash" x1="450" y1="52" x2="450" y2="280"/>
+          </svg>
+        </div>
+        <figcaption>
+          Same file, same ten lines, two cutting strategies. The right-hand boundaries
+          are what let a result say <code>file.py:104&#8209;202</code> and be exactly right &mdash;
+          a window index can only ever point at &ldquo;somewhere around here&rdquo;.
+        </figcaption>
+      </figure>
+
+      <div class="grid g3" style="margin-top:22px">
+        <div class="card">
+          <span class="tag">Rule 1</span>
+          <p>A chunk is a function, class, or statement &mdash; whatever the language calls a unit.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Rule 2</span>
+          <p>Too big to embed? Split it into labelled parts rather than truncating it.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Rule 3</span>
+          <p>Anything the parser skipped still gets indexed, so no line is ever lost.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 05 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 05 &nbsp;·&nbsp; Stage 3</div>
+      <h2>Index the same chunks twice.</h2>
+      <p class="lede">
+        Both indexes are built from one chunk list, so a hit in either can be traced to
+        the same lines of code.
+      </p>
+      <div class="grid g2">
+        <div class="card dense">
+          <span class="tag dense-t">Index A &nbsp;/&nbsp; meaning</span>
+          <h3>Turn each chunk into a list of numbers.</h3>
+          <p style="margin-bottom:10px">
+            A small model that runs on the CPU converts text into coordinates. Chunks about
+            similar things land near each other, so a question can be turned into
+            coordinates too, and you look up the nearest neighbours.
+          </p>
+          <p><strong>Catch:</strong> the model has a size limit. Measure chunk length with
+          the model's own counter &mdash; guessing from character count silently chops the
+          ends off your longest chunks.</p>
+        </div>
+        <div class="card lex">
+          <span class="tag lex-t">Index B &nbsp;/&nbsp; exact text</span>
+          <h3>Count words, rank by rarity.</h3>
+          <p style="margin-bottom:10px">
+            A classic keyword ranker. Rare words in a short chunk score highest, which is
+            exactly the behaviour you want for a distinctive function name.
+          </p>
+          <p><strong>Catch:</strong> split identifiers the way programmers write them.
+          Store <code>getUserToken</code> whole <em>and</em> as
+          <code>get</code>&#8203;/&#8203;<code>user</code>&#8203;/&#8203;<code>token</code>, or a search for
+          one form never finds the other.</p>
+        </div>
+      </div>
+      <p class="note">
+        Both indexes must use the same word-splitting rules at index time and query time.
+        A mismatch here is invisible &mdash; nothing errors, results are just quietly worse.
+      </p>
+    </div>
+  </section>
+
+  <!-- 06 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 06 &nbsp;·&nbsp; Stage 4</div>
+      <h2>Merging two rankings.</h2>
+      <p class="lede">
+        Each index returns its own ordered list. Their scores are on different scales and
+        cannot be compared &mdash; but their <em>positions</em> can. Score every result by
+        where it placed, then add the scores up.
+      </p>
+
+      <figure>
+        <div class="figwrap">
+          <svg class="dia" viewBox="0 0 900 340" role="img"
+               aria-label="Two ranked result lists are merged. A chunk placed fourth by the meaning search and first by the keyword search finishes first overall, beating a chunk placed first by meaning but ninth by keyword, because appearing high in both lists outweighs appearing top in only one.">
+
+            <text class="d-dense-t" x="40" y="34">MEANING SEARCH SAYS</text>
+            <text class="d-lex-t" x="40" y="196">KEYWORD SEARCH SAYS</text>
+            <text class="d-lbl" x="620" y="34">MERGED RESULT</text>
+
+            <!-- dense list -->
+            <rect class="d-dense-f" x="40" y="48" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="68">1</text>
+            <text class="d-txt"  x="76" y="68">parseAuthHeader</text>
+            <rect class="d-fill d-stroke" x="40" y="82" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="102">2</text>
+            <text class="d-txt"  x="76" y="102">SessionStore</text>
+            <rect class="d-fill d-stroke" x="40" y="116" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="136">3</text>
+            <text class="d-txt"  x="76" y="136">makeCookie</text>
+            <rect class="d-dense-f" x="40" y="150" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="170">4</text>
+            <text class="d-txt"  x="76" y="170">refreshToken</text>
+
+            <!-- lexical list -->
+            <rect class="d-lex-f" x="40" y="210" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="230">1</text>
+            <text class="d-txt"  x="76" y="230">refreshToken</text>
+            <rect class="d-fill d-stroke" x="40" y="244" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="264">2</text>
+            <text class="d-txt"  x="76" y="264">tokenBucket</text>
+            <rect class="d-fill d-stroke" x="40" y="278" width="230" height="30" rx="2"/>
+            <text class="d-num"  x="54" y="298">&hellip;</text>
+            <text class="d-txt"  x="76" y="298">parseAuthHeader</text>
+            <text class="d-num"  x="248" y="298" text-anchor="end">9</text>
+
+            <!-- merged list -->
+            <rect class="d-fill d-stroke d-emph" x="620" y="48" width="240" height="34" rx="2"/>
+            <text class="d-num"  x="636" y="70">1</text>
+            <text class="d-txt"  x="658" y="70">refreshToken</text>
+            <rect class="d-fill d-stroke" x="620" y="90" width="240" height="34" rx="2"/>
+            <text class="d-num"  x="636" y="112">2</text>
+            <text class="d-txt"  x="658" y="112">parseAuthHeader</text>
+            <rect class="d-fill d-stroke" x="620" y="132" width="240" height="34" rx="2"/>
+            <text class="d-num"  x="636" y="154">3</text>
+            <text class="d-txt"  x="658" y="154">SessionStore</text>
+
+            <!-- connectors -->
+            <path class="d-dense" d="M274,165 C420,165 470,72 616,66" marker-end="url(#ar-d)"/>
+            <path class="d-lex"   d="M274,225 C420,225 470,80 616,74" marker-end="url(#ar-l)"/>
+            <path class="d-dense d-dash" d="M274,63 C400,63 470,100 616,106" marker-end="url(#ar-d)"/>
+            <path class="d-lex d-dash"   d="M274,293 C420,293 480,124 616,116" marker-end="url(#ar-l)"/>
+
+            <!-- the arithmetic -->
+            <rect class="d-sunk" x="316" y="196" width="252" height="112" rx="3"/>
+            <text class="d-lbl" x="332" y="220">HOW THE SCORE WORKS</text>
+            <text class="d-txt" x="332" y="246">score = sum of  1 / (60 + rank)</text>
+            <text class="d-dense-t" x="332" y="270">refreshToken   4th + 1st  =  high</text>
+            <text class="d-lex-t" x="332" y="290">parseAuth      1st + 9th  =  lower</text>
+          </svg>
+        </div>
+        <figcaption>
+          Placing well in <em>both</em> lists beats topping one and sinking in the other.
+          The constant (60) is a damper: it keeps rank 1 from overwhelming rank 3, so a
+          single confident engine cannot hijack the result.
+        </figcaption>
+      </figure>
+
+      <div class="grid g2" style="margin-top:20px">
+        <div class="card">
+          <span class="tag">Refinement</span>
+          <p>Weight the two lists by question shape. A bare identifier should trust the
+          keyword side; a written-out question should trust the meaning side.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Refinement</span>
+          <p>Nudge up any chunk whose own name is a word the user typed. Rank alone cannot
+          express &ldquo;this chunk <em>is</em> the thing you asked for&rdquo;.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 07 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 07 &nbsp;·&nbsp; Stage 5</div>
+      <h2>Handing it to the assistant.</h2>
+      <p class="lede">
+        The index is exposed as a small set of tools over a standard protocol, so any
+        assistant can use it without custom glue. Each tool answers a different shape of
+        question &mdash; and says so clearly enough that the model picks the right one.
+      </p>
+      <div class="grid g3">
+        <div class="card">
+          <span class="tag">Tool</span>
+          <h3>Search</h3>
+          <p>&ldquo;Where is X implemented?&rdquo; Runs both engines, merges, returns
+          signatures plus exact line ranges.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Tool</span>
+          <h3>Find a symbol</h3>
+          <p>Where a name is defined and where it's used, definitions ranked first.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Tool</span>
+          <h3>Literal search</h3>
+          <p>Searches the live files, not the index. Proves a string exists &mdash; or
+          truly does not.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Tool</span>
+          <h3>Read lines</h3>
+          <p>Pull exact ranges from many files in one call, instead of many reads.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Tool</span>
+          <h3>Status</h3>
+          <p>How big the index is, when it was built, and which files have drifted since.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Tool</span>
+          <h3>Refresh</h3>
+          <p>Re-index after edits. Only changed files are redone.</p>
+        </div>
+      </div>
+      <p class="note">
+        Two habits worth copying: return a compact preview by default and let the model ask
+        for the full body, so context isn't wasted &mdash; and when the index looks out of
+        date, say so <em>in the result</em> instead of answering confidently from stale data.
+      </p>
+    </div>
+  </section>
+
+  <!-- 08 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 08 &nbsp;·&nbsp; Keeping it true</div>
+      <h2>An index is only as good as it is current.</h2>
+      <p class="lede">
+        Rebuilding everything after each edit is too slow to run often, so it doesn't get
+        run &mdash; and a stale index is worse than none, because it is confidently wrong.
+      </p>
+
+      <figure>
+        <div class="figwrap">
+          <svg class="dia" viewBox="0 0 900 250" role="img"
+               aria-label="Freshness workflow: each repository is pulled, every file is hashed, unchanged files are reused from the previous index, and only changed files are re-split and re-embedded. Progress is saved periodically so an interrupted run resumes rather than restarting.">
+
+            <!-- repos -->
+            <rect class="d-fill d-stroke" x="24" y="52" width="104" height="32" rx="2"/>
+            <text class="d-txt" x="76" y="73" text-anchor="middle">repo A</text>
+            <rect class="d-fill d-stroke" x="24" y="94" width="104" height="32" rx="2"/>
+            <text class="d-txt" x="76" y="115" text-anchor="middle">repo B</text>
+            <rect class="d-fill d-stroke" x="24" y="136" width="104" height="32" rx="2"/>
+            <text class="d-txt" x="76" y="157" text-anchor="middle">repo C</text>
+            <text class="d-lbl" x="24" y="42">EVERY REPO, NOT JUST ONE</text>
+
+            <!-- pull -->
+            <rect class="d-fill d-stroke" x="186" y="86" width="118" height="48" rx="3"/>
+            <text class="d-txt" x="245" y="106" text-anchor="middle">Pull latest</text>
+            <text class="d-lbl" x="245" y="123" text-anchor="middle">skip if dirty</text>
+            <line class="d-line" x1="132" y1="110" x2="182" y2="110" marker-end="url(#ar-n)"/>
+
+            <!-- hash -->
+            <rect class="d-fill d-stroke" x="362" y="86" width="118" height="48" rx="3"/>
+            <text class="d-txt" x="421" y="106" text-anchor="middle">Hash every</text>
+            <text class="d-txt" x="421" y="123" text-anchor="middle">file</text>
+            <line class="d-line" x1="308" y1="110" x2="358" y2="110" marker-end="url(#ar-n)"/>
+
+            <!-- split: unchanged / changed -->
+            <rect class="d-fill d-stroke d-dash" x="546" y="36" width="150" height="44" rx="3"/>
+            <text class="d-txt" x="621" y="55" text-anchor="middle">unchanged</text>
+            <text class="d-lbl" x="621" y="71" text-anchor="middle">reuse as-is</text>
+
+            <rect class="d-dense-f" x="546" y="140" width="150" height="44" rx="3"/>
+            <text class="d-txt" x="621" y="159" text-anchor="middle">changed</text>
+            <text class="d-dense-t" x="621" y="175" text-anchor="middle">re-split + re-embed</text>
+
+            <path class="d-line d-dash" d="M484,102 C516,102 516,58 542,58" marker-end="url(#ar-n)"/>
+            <path class="d-dense" d="M484,120 C516,120 516,162 542,162" marker-end="url(#ar-d)"/>
+
+            <!-- index -->
+            <rect class="d-fill d-stroke" x="762" y="86" width="114" height="48" rx="3"/>
+            <text class="d-txt" x="819" y="106" text-anchor="middle">Updated</text>
+            <text class="d-txt" x="819" y="123" text-anchor="middle">index</text>
+            <path class="d-line d-dash" d="M700,58 C736,58 736,100 758,104" marker-end="url(#ar-n)"/>
+            <path class="d-dense" d="M700,162 C736,162 736,120 758,116" marker-end="url(#ar-d)"/>
+
+            <!-- checkpoint -->
+            <line class="d-lex" x1="621" y1="188" x2="621" y2="212"/>
+            <rect class="d-lex-f" x="502" y="212" width="238" height="30" rx="2"/>
+            <text class="d-lex-t" x="621" y="231" text-anchor="middle">SAVE PROGRESS AS YOU GO</text>
+          </svg>
+        </div>
+        <figcaption>
+          Hashing every file is cheap; re-embedding is not. Only files whose contents
+          actually changed are redone, which turns a full rebuild into a few seconds of work.
+        </figcaption>
+      </figure>
+
+      <div class="grid g3" style="margin-top:20px">
+        <div class="card">
+          <span class="tag">Trap</span>
+          <p>A long first build that crashes at 90% and restarts from zero. Save progress
+          periodically so it resumes.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Trap</span>
+          <p>Auto-refresh wired into one repository while the others drift silently.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Trap</span>
+          <p>Touching a colleague's uncommitted work. Never pull a dirty checkout &mdash;
+          skip it and say why.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 09 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 09 &nbsp;·&nbsp; Scale</div>
+      <h2>What breaks first, and when.</h2>
+      <p class="lede">
+        This design holds comfortably into the tens of thousands of chunks. Past that, the
+        limits arrive in a predictable order &mdash; and none of them is the vector search.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>What gives out</th>
+              <th>Why</th>
+              <th>Roughly when</th>
+              <th>What to do</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="k">Memory</td>
+              <td>Every chunk's text is held in RAM for the life of the server</td>
+              <td class="num">~300k chunks</td>
+              <td>Keep text on disk; load only the results you return</td>
+            </tr>
+            <tr>
+              <td class="k">Scanning for a symbol</td>
+              <td>Checks every chunk one at a time</td>
+              <td class="num">~250k chunks</td>
+              <td>Build a name &rarr; chunk lookup while indexing</td>
+            </tr>
+            <tr>
+              <td class="k">Keyword ranking</td>
+              <td>Pure interpreted loops over the whole corpus per query</td>
+              <td class="num">~250k chunks</td>
+              <td>Swap in a real inverted index</td>
+            </tr>
+            <tr>
+              <td class="k">Saving the index</td>
+              <td>The whole file is rewritten even for a one-line edit</td>
+              <td class="num">~150k chunks</td>
+              <td>Write per-file records instead of one blob</td>
+            </tr>
+            <tr>
+              <td class="k">First build time</td>
+              <td>Embedding is the slow step and it is one-off</td>
+              <td class="num">hours, at millions of tokens</td>
+              <td>Checkpoint it; split the work per project</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        Two numbers worth knowing before you plan: chunk count is driven by how many
+        <em>symbols</em> your code has, not by total size divided by chunk size &mdash;
+        expect several times more chunks than a windowing estimate predicts. And token
+        counts differ by model, often by 25&ndash;30%, so count with the tokenizer you
+        will actually use.
+      </p>
+    </div>
+  </section>
+
+  <!-- 10 ------------------------------------------------------------------ -->
+  <section class="plate">
+    <div class="inner">
+      <div class="eyebrow">Plate 10 &nbsp;·&nbsp; The recipe</div>
+      <h2>Ten steps, any repository.</h2>
+      <ol class="steps">
+        <li><span class="n">01</span><div><h3>Survey before you build</h3><p>Find the generated files, lock files and build output. Excluding them is the cheapest quality win available.</p></div></li>
+        <li><span class="n">02</span><div><h3>Put every setting in one file</h3><p>Paths, model, exclusions, word-splitting. Both the indexer and the server read from it, so they cannot drift apart.</p></div></li>
+        <li><span class="n">03</span><div><h3>Chunk with a parser</h3><p>Cut on functions and classes. Record exact start and end lines on every chunk.</p></div></li>
+        <li><span class="n">04</span><div><h3>Measure length with the real tokenizer</h3><p>Character-count estimates silently truncate your densest chunks.</p></div></li>
+        <li><span class="n">05</span><div><h3>Build both indexes from the same chunks</h3><p>Meaning and exact text. Same word-splitting at index and query time.</p></div></li>
+        <li><span class="n">06</span><div><h3>Merge by rank, not by score</h3><p>Then weight by question shape and boost exact name matches.</p></div></li>
+        <li><span class="n">07</span><div><h3>Hash files so rebuilds are incremental</h3><p>And save progress during long builds so a crash resumes.</p></div></li>
+        <li><span class="n">08</span><div><h3>Serve it over a standard tool protocol</h3><p>No vendor-specific fields, so any assistant can use it.</p></div></li>
+        <li><span class="n">09</span><div><h3>Make staleness loud</h3><p>Warn in the result itself. Confirm negative answers against the live files.</p></div></li>
+        <li><span class="n">10</span><div><h3>Measure every constant you guard a resource with</h3><p>Batch sizes, result limits, safety caps. A confident comment above a guessed number is still a guessed number.</p></div></li>
+      </ol>
+      <div class="kv">
+        <span>parser-based chunking</span>
+        <span>dense + lexical</span>
+        <span>rank fusion</span>
+        <span>incremental</span>
+        <span>offline</span>
+        <span>tool-protocol native</span>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+  (function () {
+    var deck = document.getElementById('deck');
+    var plates = Array.prototype.slice.call(document.querySelectorAll('.plate'));
+    var bar = document.getElementById('bar');
+    var pos = document.getElementById('pos');
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+
+    function current() {
+      var mid = window.innerHeight / 2, best = 0, bestD = Infinity;
+      plates.forEach(function (p, i) {
+        var r = p.getBoundingClientRect();
+        var d = Math.abs(r.top + r.height / 2 - mid);
+        if (d < bestD) { bestD = d; best = i; }
+      });
+      return best;
+    }
+    function update() {
+      var i = current();
+      pos.textContent = pad(i + 1) + ' / ' + pad(plates.length);
+      var max = document.documentElement.scrollHeight - window.innerHeight;
+      bar.style.width = (max > 0 ? (window.scrollY / max) * 100 : 0) + '%';
+    }
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) { ticking = true; requestAnimationFrame(function () { update(); ticking = false; }); }
+    }, { passive: true });
+    window.addEventListener('resize', update);
+
+    document.addEventListener('keydown', function (e) {
+      if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+      var i = current(), to = null;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === 'PageDown') to = i + 1;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'PageUp') to = i - 1;
+      if (e.key === 'Home') to = 0;
+      if (e.key === 'End') to = plates.length - 1;
+      if (to === null) return;
+      to = Math.max(0, Math.min(plates.length - 1, to));
+      e.preventDefault();
+      plates[to].scrollIntoView({ block: 'start' });
+    });
+
+    var themer = document.getElementById('themer');
+    themer.addEventListener('click', function () {
+      var root = document.documentElement;
+      var explicit = root.getAttribute('data-theme');
+      var dark = explicit ? explicit === 'dark'
+        : window.matchMedia('(prefers-color-scheme: dark)').matches;
+      root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    });
+
+    update();
+  })();
+</script>

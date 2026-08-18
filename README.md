@@ -17,6 +17,7 @@ No sudo, no daemon, no vendor lock-in, and no network at query time.
 | **`create_rag.md`** | The runbook. A complete, self-contained build guide — survey the target repo, write each file, wire up the client, verify. Hand it to an agent or follow it yourself. |
 | `rag-workspace/` | The reference implementation the runbook produces. Copy it into the repo you want to index, or build it from the runbook. |
 | `skills/rag/SKILL.md` | An interactive, one-step-at-a-time setup skill for agents that support skills. |
+| [`docs/architecture.html`](docs/architecture.html) | A ten-slide visual explainer of how the whole thing works — the pipeline, chunking, hybrid search, rank fusion, and where it breaks at scale. Open it in a browser. |
 
 ## Quickstart
 
