@@ -21,6 +21,8 @@ repository, a vendor, or a model.
 - The index is read through a **restricted unpickler**, so a tampered index file
   cannot execute code inside the MCP server
 - Runs entirely in user space: no sudo, no daemon, no network at query time
+- The workspace is self-contained and indexes its **parent** directory, so it can be
+  its own git checkout dropped into any project without disturbing that project's tree
 
 **Requirements.** Python 3.9+, `git` (optional but recommended), ~500 MB disk for the
 virtualenv and model, and one network fetch during setup to install packages and cache
@@ -28,6 +30,11 @@ the model weights. After setup, nothing phones home.
 
 **Conventions in this document.** `<TARGET>` is the repository root you are indexing;
 `<WORKSPACE>` is `<TARGET>/rag-workspace`. Replace them literally, or export them:
+
+> **Already have this repository?** Then you can skip to Phase 6 — clone it straight
+> into your project as the workspace and the files below are already written for you:
+> `git clone <this repo> "$TARGET/rag-workspace"`. Work through the phases anyway if
+> you want to understand what each file is doing, or are adapting it.
 
 ```bash
 export TARGET="$(pwd)"
@@ -195,13 +202,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _detect_repo_root() -> str:
-    """RAG_REPO_ROOT env > enclosing git worktree > parent of rag-workspace."""
+    """RAG_REPO_ROOT env > git worktree enclosing the PARENT > parent directory.
+
+    Note it asks git about the parent, never about this directory. The workspace
+    is distributed as its own checkout, so `git -C <workspace> rev-parse
+    --show-toplevel` answers with the workspace itself -- and indexing that
+    would index the retrieval tooling instead of the code you wanted to search,
+    silently and with no error to notice.
+    """
     env = os.environ.get("RAG_REPO_ROOT")
     if env:
         return os.path.abspath(os.path.expanduser(env))
+    parent = os.path.dirname(BASE_DIR)
     try:
         out = subprocess.check_output(
-            ["git", "-C", BASE_DIR, "rev-parse", "--show-toplevel"],
+            ["git", "-C", parent, "rev-parse", "--show-toplevel"],
             stderr=subprocess.DEVNULL, timeout=5,
         )
         root = out.decode().strip()
@@ -209,7 +224,7 @@ def _detect_repo_root() -> str:
             return root
     except Exception:
         pass
-    return os.path.dirname(BASE_DIR)
+    return parent
 
 
 REPO_ROOT = _detect_repo_root()

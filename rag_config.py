@@ -24,13 +24,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _detect_repo_root() -> str:
-    """RAG_REPO_ROOT env > enclosing git worktree > parent of rag-workspace."""
+    """RAG_REPO_ROOT env > git worktree enclosing the PARENT > parent directory.
+
+    Note it asks git about the parent, never about this directory. The workspace
+    is distributed as its own checkout, so `git -C <workspace> rev-parse
+    --show-toplevel` answers with the workspace itself -- and indexing that
+    would index the retrieval tooling instead of the code you wanted to search,
+    silently and with no error to notice.
+    """
     env = os.environ.get("RAG_REPO_ROOT")
     if env:
         return os.path.abspath(os.path.expanduser(env))
+    parent = os.path.dirname(BASE_DIR)
     try:
         out = subprocess.check_output(
-            ["git", "-C", BASE_DIR, "rev-parse", "--show-toplevel"],
+            ["git", "-C", parent, "rev-parse", "--show-toplevel"],
             stderr=subprocess.DEVNULL, timeout=5,
         )
         root = out.decode().strip()
@@ -38,7 +46,7 @@ def _detect_repo_root() -> str:
             return root
     except Exception:
         pass
-    return os.path.dirname(BASE_DIR)
+    return parent
 
 
 REPO_ROOT = _detect_repo_root()

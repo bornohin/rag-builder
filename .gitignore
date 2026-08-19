@@ -2,25 +2,22 @@
 # These embed VERBATIM SOURCE TEXT of whatever repository you indexed.
 # Committing them publishes that code. They rebuild in one command; never
 # commit them, not even "just this once" on a private fork.
-rag-workspace/rag_index.pkl
-rag-workspace/rag_index.pkl.tmp
-rag-workspace/rag_index.pkl.ckpt
-rag-workspace/rag_index.pkl.ckpt.tmp
-rag-workspace/bm25_index.pkl
-rag-workspace/chroma_db/
-rag-workspace/rag.log
+rag_index.pkl
+rag_index.pkl.tmp
+rag_index.pkl.ckpt
+rag_index.pkl.ckpt.tmp
+bm25_index.pkl
+chroma_db/
+rag.log
 
 # --- Local environment (large, machine-specific, regenerable) -------------
-rag-workspace/.poc-venv/
-rag-workspace/.models_cache/
-rag-workspace/__pycache__/
-rag-workspace/:memory:*
+.poc-venv/
+.models_cache/
 __pycache__/
 *.py[cod]
+:memory:*
 
-# --- Assistant / editor / OS ----------------------------------------------
-.claude/settings.local.json
-.mcp.json
+# --- Editor / OS -----------------------------------------------------------
 .DS_Store
 .idea/
 .vscode/
