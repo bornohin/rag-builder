@@ -1,18 +1,24 @@
 # Interview Study Plan — AI Engineering (Advanced) Role
 
 Companion to `interview-study-answers.md`. Try to answer each question yourself —
-out loud, in your own words — before checking the answer doc. If you can't
-answer a project-specific question from memory, that's your signal to reread
-that part of the actual source, not the answer doc.
+out loud, in your own words — before checking the answer doc. If you can't answer a
+project-specific question from memory, that's your signal to reread that part of the
+actual source.
+
+**The bar to aim for:** for every Project question, be able to state the mechanism,
+the constant, and *why the constant has that value*. Interviewers stop at the first
+layer where you're paraphrasing instead of explaining, so the depth you can go to
+matters more than the breadth you can cover.
 
 ---
 
 ## How to use this
 
 1. Go section by section. Don't skip to the answers.
-2. For every "Project" question, answer using **your own words**, then verify
-   against the code (`rag_config.py`, `mcp_server.py`, etc.) — not just the
-   answer doc. The answer doc is a check, not a substitute for reading the code.
+2. For every "Project" question, answer using **your own words**, then check the
+   answer doc — its Project sections are verified against the source, so a
+   disagreement means either you misremembered or the code changed. Both are worth
+   knowing before an interview, not during one.
 3. For every "Fundamentals" question, write a 3–5 sentence answer from memory.
    These are the questions that get asked regardless of what project you bring.
 4. Do one pass for recall, then a second pass a few days later. Spacing beats
@@ -42,6 +48,7 @@ Suggested schedule (adjust to your timeline):
 9. Every hit returns `file:start_line-end_line`. Walk through how that's tracked from chunking through to the response — where does that metadata live?
 10. Why does the system embed on CPU instead of GPU? What's the actual tradeoff you're making?
 11. What does "100% local / offline" actually buy you, technically and practically, versus calling an embeddings API?
+12. How do you know your chunks aren't being silently truncated by the embedding model? What did you actually measure, and what did you change as a result?
 
 ## Section B — Project: Hybrid Search, Fusion, Ranking
 
@@ -64,10 +71,11 @@ Suggested schedule (adjust to your timeline):
 6. What is `get_file_context` for, and why is batching line ranges useful — what would the alternative look like without it?
 7. What does `rag_status` report, and why would an agent (or a human debugging) need it mid-session?
 8. Walk through what `reindex` does differently from the initial `--full` ingest.
-9. Explain the ingest checkpointing mechanism — why SHA-1 of file contents specifically, not a timestamp or a line count?
+9. There are two distinct mechanisms that both use file hashing — the incremental manifest and crash-resume checkpointing. Explain each, and say why SHA-1 of file *contents* rather than a timestamp or line count. Why must resume be gated on the hash rather than on chunk IDs alone?
 10. Describe the multi-repo bug that was fixed this session (hooks re-indexing and deleting other repos' chunks) — what was the root cause, and what's the general lesson about state/scope bugs it illustrates?
 11. Why is the path-pushdown cap relevant at all — what is "path pushdown" doing, and why was 400 too conservative?
 12. What are git hooks doing in `install_hooks.sh`, and why are they described as "optional belt-and-braces" now that `sync_and_index.sh` exists?
+13. Why must `rag_index.pkl` and `chroma_db/` never be committed to a public repository? What does that tell you about what the system retains?
 
 ## Section D — Project: Scale, Failure Modes, Tradeoffs (this is where seniority shows)
 
@@ -81,6 +89,7 @@ Suggested schedule (adjust to your timeline):
 8. The reranker is opt-in via an environment variable. Why does turning it on conflict with the "100% offline" guarantee, and what does it cost you (latency/dependencies) to enable it?
 9. If asked "how would you scale this to 10x the current size," what's your actual answer — not aspirational, but grounded in the bottlenecks you've already identified?
 10. What's a failure mode in this system that ISN'T in your handoff doc yet — i.e., what would you go find out empirically if you had another week?
+11. Describe a bug where every individual step was correct but the code was asking the wrong question. (There are two in this project — having both ready makes it read as a pattern you recognise, not a one-off.)
 
 ## Section E — Fundamentals: Embeddings & Vector Search
 
@@ -91,7 +100,7 @@ Suggested schedule (adjust to your timeline):
 5. Name two ANN algorithms/index types (e.g. HNSW, IVF) and describe the core idea of at least one.
 6. What's the "curse of dimensionality" and how does it relate to nearest-neighbor search quality?
 7. What is chunking, and what's the fundamental tension in choosing chunk size (too small vs. too large)?
-8. What is chunk overlap, and why might you use it — and why might it be a bad idea for structured content like code?
+8. What is chunk overlap, and why might you use it? Does syntax-aware code chunking need it? (Careful — the obvious answer is only half right; check what your own chunker actually does at split points and parser gaps.)
 9. What does "embedding drift" mean, and why does re-indexing become necessary if you change embedding models?
 
 ## Section F — Fundamentals: LLM Basics

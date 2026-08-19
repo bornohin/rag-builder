@@ -3,449 +3,599 @@
 Companion to `interview-study-questions.md`. Read a question, write your own
 answer, THEN check here.
 
-**Important caveat on the "Project" sections:** these answers are built from
-your handoff doc and general RAG/IR knowledge — they are a strong scaffold,
-not a transcript of your actual source. Before an interview, confirm every
-Project-section answer against the real code in `rag-workspace/` (function
-names, exact parameter names, exact constants). Where I'm inferring rather
-than quoting your doc, I've said so.
+**Status of these answers.** The Project sections (A–D) are **verified against the
+source** at commit `508610b` — every constant, function name and behaviour below was
+read out of `rag_config.py`, `rag_chunker.py`, `ingest_codebase.py` and
+`mcp_server.py`, not inferred. Where a number came from a measurement, the
+measurement is quoted so you can repeat it. Sections E–H are general knowledge and
+carry no project claims.
+
+Two things this buys you in an interview: you can state a constant and say *why it
+has that value*, and when someone pushes one level deeper you have the mechanism
+rather than a paraphrase. If you change the code, re-verify — a stale answer key is
+worse than none, because you'll say it with confidence.
 
 ---
 
 ## Section A — Project: RAG Fundamentals
 
 **1. End-to-end flow (ingest → query)**
-Ingest: walk the target repo → for each source file, parse with Tree-sitter
-to get a syntax tree → split into chunks along syntactic boundaries (functions,
-classes, etc.) rather than raw character counts → run each chunk through the
-ONNX embedding model to get a vector → store vectors + metadata in ChromaDB,
-and simultaneously build/update a BM25 index over the same chunk text →
-checkpoint progress (SHA-1 per file) so a crash can resume instead of
-restarting. Query: the MCP tool receives a query string → it's run through
-both retrieval paths (embedding similarity search in Chroma, BM25 lexical
-search) → results from both are combined via query-adaptive weighted RRF →
-top results are returned to the caller with exact `file:start_line-end_line`
-metadata attached to each chunk.
+*Ingest* (`ingest_codebase.py`): walk the repo root, skipping `EXCLUDE_DIRS` and
+lock/generated files → read each file and SHA-1 it → compare against the previous
+manifest; unchanged files reuse their existing chunks verbatim → changed files go to
+`rag_chunker.extract_chunks()`, which parses with tree-sitter and emits chunks on
+symbol boundaries → new chunks are embedded in batches of 256 through the ONNX model
+and upserted into ChromaDB with their metadata → progress is checkpointed every 20
+batches → finally BM25 is rebuilt over *all* chunks and the whole state (chunks,
+manifest, BM25, meta) is written to `rag_index.pkl` via tmp-file + `os.replace`, so
+the server never sees a half-written file.
+
+*Query* (`mcp_server.py:search_codebase`): the query gets the model's asymmetric
+prefix (`"Represent this sentence for searching relevant passages: "` for bge) and is
+embedded → ChromaDB returns the top-N by vector similarity, with category and path
+filters pushed down into the query → in parallel BM25 scores the same query tokens
+over the whole corpus → both ranked lists go into weighted RRF, plus a symbol boost →
+optionally a cross-encoder rerank → each hit is formatted with
+`file:start_line-end_line`, the symbol name, and a skeleton preview.
 
 **2. Tree-sitter vs. fixed-size chunking**
-Tree-sitter parses code into a concrete syntax tree, so chunk boundaries can
-be placed at meaningful units (function/class boundaries) instead of an
-arbitrary character offset. Fixed-size chunking will happily cut a function
-in half, split a signature from its body, or straddle two unrelated
-functions — which damages both embedding quality (the vector represents a
-semantically incoherent blob) and BM25 quality (term co-occurrence gets
-scrambled). Syntax-aware chunking keeps each chunk a coherent, self-contained
-unit that a retrieval hit can be usefully acted on.
+Tree-sitter produces a concrete syntax tree, so boundaries land on real units —
+`function_declaration`, `class_declaration`, and so on per language in
+`CHUNK_TYPES`. Fixed windows cut a function in half, separate a signature from its
+body, or straddle two unrelated functions. That damages retrieval twice: the
+embedding becomes an average of two half-thoughts, and BM25's term co-occurrence gets
+scrambled.
 
-**3. What is a "chunk," and edge cases**
-Typically a function, method, or class (the granularity a developer would
-naturally reference). Edge cases — a very large function, or file-level
-constants/imports that aren't inside any named node — need explicit handling:
-either a size-based sub-split within a large node, or a fallback "gap chunk"
-for code that doesn't belong to a named symbol. Your handoff doc references
-"unnamed gap chunks" for Go/Rust/Kotlin/Swift being fixed via a broadened
-fallback symbol regex — confirm exactly how gap chunks are named/handled in
-`rag_chunker.py` before the interview, since this is a natural follow-up
-question.
+The payoff that matters most in practice is **citation precision**. Because a chunk
+*is* a node, `start_line`/`end_line` describe the symbol itself, so a hit can be
+handed straight to a file reader. A window index can only ever say "somewhere around
+here."
 
-**4. ONNX vs. PyTorch/HF directly**
-ONNX Runtime is a lighter, framework-independent inference runtime — you
-export the trained weights once into the ONNX graph format, then run
-inference without needing PyTorch, CUDA, or the HuggingFace `transformers`
-runtime as dependencies. This matters directly for two of your stated design
-goals: (a) "no daemon, no network at query time" — ONNX has a small,
-predictable footprint suited to CPU-only, offline operation, and (b) faster
-cold-start/lower memory than loading a full PyTorch model, which matters when
-this runs as a stdio subprocess spun up per session rather than a persistent
-service.
+**3. What is a "chunk," and the edge cases**
+The unit is whatever the language calls a declaration. Three edge cases, all handled
+explicitly in `rag_chunker.py`:
 
-**5. Why bge-small-en-v1.5**
-It's a strong small embedding model for its size class — good retrieval
-quality per FLOP, small enough to run comfortably on CPU with low latency
-(your doc reports ~10ms searches). Swapping to `bge-base` would likely
-improve embedding quality (richer representations) at the cost of slower
-inference and more memory — which is exactly the tradeoff your deferred-work
-section flags for the 6.2M-token scale target ("consider bge-base"). Any
-model swap also invalidates the existing index — embeddings from two
-different models aren't comparable, so a full reindex is required (this is
-the "embedding drift" fundamental — see Section E.9).
+- **Oversized symbol** — if a node exceeds the token budget, `_chunkable_children()`
+  first tries to decompose it into its real inner symbols (this is what lets a
+  1,200-line `const Provider = () => {…}` become its actual methods). Only if there
+  are no structural children does `_split_oversized()` cut it into labelled
+  `part i/n` pieces, carrying ~12% overlap so a split symbol stays findable from
+  either side.
+- **Code no node claimed** — imports, top-level statements, parse errors. `_gap_chunks()`
+  window-indexes those with `GAP_WINDOW = 40` lines and `GAP_OVERLAP = 8`, skipping
+  gaps under `MIN_GAP_LINES = 4`. This guarantees every line lands in some chunk, so
+  recall is never worse than a naive window index.
+- **No symbol name resolvable** — `_fallback_symbol()` runs a set of
+  declaration regexes covering Go receivers, Rust `pub async unsafe fn`, Kotlin/Dart
+  annotations, Swift/Java modifiers and C/C++ definitions. Before that existed, gap
+  chunks in those languages came back anonymous and were unreachable by symbol name.
+
+**4. ONNX vs. PyTorch/HuggingFace directly**
+Via `fastembed`, the model runs as an ONNX graph on ONNX Runtime — no PyTorch, no
+CUDA, no `transformers` at runtime. Concretely: the dependency list is four packages
+instead of a multi-gigabyte ML stack, cold start is fast enough that the server can
+be a per-session stdio subprocess rather than a long-lived service, and there is no
+GPU/driver setup to get wrong on a colleague's laptop.
+
+**5. Why `bge-small-en-v1.5`**
+384 dimensions, a 512-token window, strong retrieval quality per FLOP, and it runs on
+CPU fast enough that a search is ~10 ms warm. It's also trained with an **asymmetric
+instruction prefix**: queries get `"Represent this sentence for searching relevant
+passages: "` and passages get nothing. `rag_config.query_prefix()` centralises that
+per model family (bge / e5 / arctic / gte) — skipping it measurably degrades recall,
+and it's an easy thing to get silently wrong.
+
+Swapping to `bge-base` (768-dim) buys quality at the cost of memory and ingest time.
+Any model change is detected in `ingest_codebase.py` (`meta["model"]` mismatch) and
+**forces a full rebuild automatically**, because vectors from two models aren't
+comparable — see E.9.
 
 **6. ChromaDB vs. BM25 — why separate stores**
-They're fundamentally different data structures solving different problems.
-ChromaDB stores dense vectors and does similarity search over continuous
-vector space (typically via an ANN index). BM25 needs an inverted index over
-tokens/terms — a completely different structure optimized for exact/fuzzy
-term matching and term-frequency statistics. There's no single data structure
-that's efficient for both; hybrid search architectures universally keep them
-separate and fuse results afterward (this is exactly what RRF is for).
+They're different data structures for different questions. Chroma holds dense vectors
+and does approximate nearest-neighbour search over continuous space; BM25 needs term
+statistics — document frequencies, per-document lengths, an average length. No single
+structure serves both efficiently, so hybrid systems keep them apart and fuse the
+*results*.
 
-**7. BM25 explained**
-BM25 scores how well a document matches a query based on term overlap,
-weighted by (a) term frequency in the document (saturating — the 10th
-occurrence of a word matters much less than the 2nd) and (b) inverse document
-frequency (rare terms across the corpus are more discriminative than common
-ones), with a length-normalization component so long documents don't win
-purely by containing more words. It's excellent at exact/near-exact lexical
-matches — e.g. a function name, an error string, a specific identifier —
-which is precisely where embeddings can be weak, since an embedding model may
-consider `getUserById` and `fetchUserByID` "similar" in a way that blurs the
-sharp, exact-match signal BM25 preserves.
+Be precise about one thing if pushed: this uses `rank_bm25`'s `BM25Okapi`, which is an
+in-memory scorer over tokenised documents, **not** a real inverted index. That's fine
+at this scale and is exactly why the scaling answer (D.2) names it as a bottleneck —
+`get_scores` does a Python-level dict lookup per document per query term.
 
-**8. "Code-aware" BM25**
-Plain BM25 over English text typically tokenizes on whitespace/punctuation
-and may apply English stemming — both wrong for code. Code-aware tokenization
-needs to handle identifier splitting (`camelCase`, `snake_case`, `kebab-case`
-all decomposed into sub-terms so a search for "refresh token" matches
-`refreshToken`), preserve meaningful punctuation/operators where relevant,
-and avoid English-specific stemming that would corrupt identifiers. Confirm
-the exact tokenizer logic in your source before the interview — this is a
-likely deep-dive question.
+**7. BM25 in your own words**
+It scores term overlap between query and document, weighted by three things:
+term frequency with **saturation** (the 10th occurrence of a word adds far less than
+the 2nd, controlled by `k1`), **inverse document frequency** (rare terms are more
+discriminative than common ones), and **length normalisation** (controlled by `b`) so
+long documents don't win just by containing more words.
+
+It's strong exactly where embeddings are weak: an exact identifier, an error string,
+a column name. An embedding model may consider `getUserById` and `fetchUserByID`
+similar — useful for prose, but it blurs the sharp exact-match signal BM25 preserves.
+
+**8. "Code-aware" BM25 — the actual implementation**
+`rag_config.tokenize()`. Two regexes: `_WORD` pulls out identifiers and numbers,
+`_CAMEL` splits camelCase. Every identifier is emitted **whole and decomposed**:
+
+```python
+tokenize("getUserToken")  ->  ['getusertoken', 'get', 'user', 'token']
+```
+
+So a search for `getUserToken`, `get user token`, or just `token` all hit. Snake_case
+is split the same way. There is **no English stemming**, which would corrupt
+identifiers.
+
+The critical property is that the *same* function is used at index time and query
+time. Asymmetric tokenisation is an invisible bug: nothing errors, results are just
+quietly worse. Chunk text is also indexed together with its filepath and symbol name,
+so a path fragment matches too.
 
 **9. Line-number tracking through the pipeline**
-At chunk-creation time (Tree-sitter parse), each chunk's start/end byte or
-line offsets in the original file are known directly from the syntax tree
-node's position. That start_line/end_line pair is stored as metadata
-alongside the chunk in both ChromaDB (as document metadata) and the BM25
-index (or a shared side-table), so any retrieval path can attach exact
-`file:start_line-end_line` to a hit without re-parsing the file at query
-time.
+Tree-sitter gives every node `start_point`/`end_point`, so `_make_chunk()` records
+`start_line`/`end_line` at construction. That metadata travels three places: into the
+chunk dict in `rag_index.pkl`, into ChromaDB as document metadata, and into the chunk
+id itself, which is `"{path}:{symbol}:{start}-{end}"` (plus `.p{n}` for a split part).
+No file is re-parsed at query time; formatting a hit is a dict read.
+
+One consequence worth volunteering, because it's a real design cost: **ids encode
+line numbers**, so inserting a line near the top of a file changes the id of every
+chunk below it, and they all get re-embedded. That's the price of citable ids, and
+it's why chunk ids must never be cached across sessions.
 
 **10. Why CPU embeddings**
-Directly serves the "no daemon, no network, no vendor lock-in" goals: a
-small model on CPU means zero GPU dependency, so the tool runs on any
-developer machine without driver/CUDA setup, and can run as a lightweight
-per-session subprocess (stdio MCP) instead of requiring a long-lived GPU
-service. The tradeoff is throughput — CPU embedding is slower per-chunk than
-GPU, which is why ingest of a large corpus takes real wall-clock time
-(your doc: 53–71 min cold ingest at the 6.2M-token scale target) rather than
-being near-instant.
+It serves the portability goal directly — no GPU, no driver setup, runs as a
+lightweight per-session subprocess. The cost is throughput: **~15 chunks/second
+measured**, so a cold ingest of a 48–64k-chunk corpus is 53–71 minutes. That number
+is precisely why ingest checkpointing exists (C.9) — at 133 seconds nobody cares if a
+crash restarts; at an hour it ruins an afternoon.
 
 **11. What "100% local/offline" actually buys you**
-Technically: no network round-trip latency at query time, no dependency on a
-third-party API's uptime/rate limits, and the codebase being indexed never
-leaves the machine. Practically: works on an air-gapped or corporate network
-with no external API allowlisting, no per-query cost, and no risk of
-proprietary source code being sent to a vendor's embedding API — which
-matters a lot if this tool is meant to be used on client/employer codebases,
-not just personal projects.
+Technically: no network round-trip in the query path, no third-party uptime or rate
+limit, no per-query cost. Practically, and this is the one that matters commercially:
+**the source code never leaves the machine**, so it works on an employer or client
+codebase where shipping proprietary source to a vendor's embedding API is simply not
+allowed. Note the honest boundary — setup does need the network once, to install
+packages and cache the model weights. After that, nothing phones home.
+
+**12. How do you know chunks aren't silently truncated?**
+This is the best "I measured it" story in the project, so have it ready.
+
+The encoder truncates anything over 512 tokens **silently** — no error, the tail is
+just gone, and the chunks that lose their tails are the longest and most informative
+ones. The chunker originally budgeted with a constant, `CHARS_PER_TOKEN = 3.0`.
+Measuring the real corpus with the encoder's own tokenizer found density ranging from
+**1.85 chars/token** (minified, bracket-dense) to ~4.0 (prose), and **11 chunks
+(0.6%) were being truncated**.
+
+The fix: count with the encoder's actual tokenizer — `tokenizers.Tokenizer` loaded
+from the `tokenizer.json` that fastembed already caches beside the ONNX weights, so no
+extra download. The character estimate survives as a cheap pre-filter: anything under
+`MAX_CHUNK_TOKENS × 1.6` chars *cannot* overflow whatever it contains, so the exact
+count is skipped for the common case and ingest speed is unchanged. `_split_oversized`
+also derives its char budget from the measured density of *that specific text* rather
+than a global constant, and verifies each resulting piece.
+
+Result: **0 truncated chunks**, and the corpus went from 1,985 to 1,840 chunks —
+*fewer*, because prose-dense chunks stopped being needlessly over-split.
 
 ---
 
 ## Section B — Project: Hybrid Search, Fusion, Ranking
 
 **1. RRF formula**
-For a document `d`, its RRF score is:
+For a document `d`:
 
-`RRF(d) = Σ over each ranker r [ 1 / (k + rank_r(d)) ]`
+`RRF(d) = Σ over rankers r [ w_r / (k + rank_r(d)) ]`
 
-where `rank_r(d)` is d's rank position (1st, 2nd, 3rd...) in ranker `r`'s
-result list, and `k` is a constant (commonly 60) that dampens the influence
-of very high ranks and keeps low-ranked-but-present documents from being
-totally negligible. You sum this across your two rankers (vector similarity
-rank, BM25 rank) to get a fused score.
+`rank_r(d)` is d's 1-based position in ranker r's list; `k` (here **60**) is a damper.
+`w_r` is the per-ranker weight, which in textbook RRF is 1 for everyone — this system
+varies it (B.3).
 
-**2. Why rank-based fusion instead of raw score summation**
-BM25 scores and cosine similarities live on completely different, incomparable
-scales (BM25 is unbounded and corpus-dependent; cosine similarity is bounded
-[-1,1] or [0,1]). Naively adding raw scores means whichever metric happens to
-have larger numbers dominates, regardless of actual relevance. RRF sidesteps
-the whole score-normalization problem by using only *rank position*, which is
-directly comparable across any two ranking methods.
+What `k` actually does: it compresses the gap between top ranks. With k=60, rank 1
+scores 1/61 and rank 3 scores 1/63 — close together. Without it (k=0), rank 1 would
+be 3× rank 3, and a single confident ranker could hijack every result. The damper is
+what makes "appeared reasonably high in *both* lists" beat "topped one list."
 
-**3. "Query-adaptive weighted" RRF**
-Standard RRF gives each ranker equal weight. Your system adjusts the two
-rankers' weights per-query based on some signal about query type — per your
-handoff doc, the intuition is "identifier queries trust BM25, prose trusts
-vectors." The likely signal is something query-shape-based (e.g. presence of
-camelCase/snake_case tokens, punctuation patterns, or fraction of terms that
-match known symbol names) that shifts weight toward BM25 for identifier-like
-queries and toward vector search for natural-language prose queries. **Confirm
-the exact signal/heuristic in `rag_config.py` before the interview** —
-this is exactly the kind of "why this constant" question that gets asked.
+**2. Why rank-based fusion instead of summing raw scores**
+BM25 scores are unbounded and corpus-dependent; cosine similarity is bounded. Adding
+them means whichever happens to produce bigger numbers wins regardless of relevance,
+and any normalisation you invent has to be re-tuned as the corpus changes. RRF uses
+only rank position, which is directly comparable across any two rankers.
 
-**4. The "2 of 8, 0 demoted" evaluation**
-This reads as a small manually-curated regression test: a fixed set of 8
-representative queries with either labeled expected results or before/after
-comparison, run against the old (fixed-weight) and new (query-adaptive)
-ranking to confirm the change didn't make anything worse ("0 demoted") while
-it improved a couple of specific cases. To trust it more, you'd want: a
-larger and more diverse query set, explicit relevance labels (not just "looks
-better"), and a quantitative metric (e.g. MRR or nDCG shift) rather than an
-eyeballed improved/demoted count. This is your most natural bridge into
-Section H (formal evaluation) — flag it as a known gap, not a hidden one.
+Know the tradeoff too, because it's the obvious follow-up: **RRF throws away
+confidence**. A BM25 hit with an enormous score and a marginal one at the same rank
+contribute identically. That is precisely the gap the symbol boost (B.5) fills.
 
-**5. Symbol boost — why it's needed on top of RRF**
-Even with query-adaptive weighting, RRF fuses two *general-purpose* rankers.
-If the query is an exact known symbol name (e.g. a function that exists
-verbatim in the index), you often want to just guarantee that exact
-definition surfaces at or near the top — a targeted boost (e.g. exact-match
-symbol lookup gets a rank/score bonus) is a cheap, high-precision override on
-top of the general fusion, rather than relying on RRF weighting alone to get
-it right.
+**3. "Query-adaptive weighted" RRF — the actual rule**
+`rag_config.query_shape()` classifies the query into three shapes, and
+`RRF_WEIGHTS` maps each to a `(dense, lexical)` pair:
 
-**6. Identifier query vs. prose query example**
-`"handle_refresh_token"` — BM25 will score this very highly against a chunk
-containing an exact or near-exact identifier match; the query-adaptive
-weighting shifts trust toward BM25's ranking, and symbol boost may push an
-exact-name match straight to the top. `"where do we validate expired
-sessions"` — this is prose with no code-token overlap; BM25 will struggle
-(none of these words may appear verbatim near the relevant code) while the
-embedding model can capture the semantic intent and match code that talks
-about token expiry/session validation even with different wording — so
-weighting shifts toward the vector ranker.
+| shape | rule | dense | lexical |
+|---|---|---|---|
+| `identifier` | ≤2 words, all bare identifiers, and at least one has an underscore, non-lowercase, or is >12 chars | 0.7 | **1.4** |
+| `natural` | ≥4 words with ≥2 stopwords (`how`, `does`, `where`, `the`…) | **1.3** | 0.8 |
+| `mixed` | everything else | 1.0 | 1.0 |
 
-**7. Candidate pool size and √(chunks) scaling**
-The "candidate pool" is how many top results each individual ranker (BM25,
-vector search) contributes into the fusion step before RRF combines them —
-too small and you might miss the actually-best result because it wasn't in
-either individual top-k; too large and fusion gets slower and noisier.
-Scaling with `top_k * 4`, and then further scaling with √(chunks), keeps the
-pool proportionate: your handoff doc's own reasoning is that a fixed
-percentage-based pool (e.g. "grab 2% of the index") is fine at 2k chunks but
-wildly oversized at 64k chunks — √(chunks) grows the pool slower than the
-corpus does, keeping candidate-set size sane at scale without needing it to
-be either a hard-coded constant or literally proportional to corpus size.
+The reasoning: a bare `refresh_access_token` that BM25 matched exactly is near-certain
+evidence, while a prose question is better served by the dense side. It's deliberately
+a cheap, inspectable heuristic rather than a learned classifier — you can read a query
+and predict the weights, which matters when debugging a bad result.
 
-**8. What breaks first if corpus doubles overnight**
-Most likely: BM25 rebuild time (rebuilt globally on every ingest — your doc
-notes 1.6s at 64k, so this scales, probably close to linearly, with corpus
-size) and raw memory footprint (more vectors + more BM25 postings resident).
-Query latency itself is more protected because of ANN search and the
-√-scaled candidate pool, but the *ingest* pipeline (BM25 rebuild + embedding
-generation for new chunks) is the first thing to feel real pain, consistent
-with your own stated degradation order (memory → symbol scan → BM25 → full
-rewrite) as chunk count climbs.
+**4. The "2 of 8, 0 demoted" evaluation — and its limits**
+Concretely: 8 identifier-ish queries, run through both the old (unweighted, unboosted)
+fusion and the new one, scoring each by **the rank at which the chunk whose own symbol
+matched the query appeared**. Two improved (`sendMessage` 3→1, `presence` 6→1), six
+unchanged, none demoted.
+
+Be first to name the weaknesses, because a good interviewer will: 8 queries is a
+sanity check, not a measurement; "the chunk whose symbol matches" is a proxy for
+relevance, not a human judgment; there are no graded labels; and there's no
+statistical power to distinguish a real gain from noise. What would earn trust: a
+larger labelled set spanning identifier / prose / multi-hop queries, and a real metric
+(nDCG or MRR) rather than a count. Flag it as a known gap — see H.3.
+
+**5. Symbol boost — why it exists on top of RRF**
+Because rank cannot express "this chunk **is** the thing you named." A definition and
+a file that merely mentions it can arrive at identical ranks from different retrievers,
+and RRF has discarded the score that would separate them.
+
+The implementation (`_symbol_boosts`) checks whether a chunk's own `symbol` metadata is
+one of the query's tokens. A full match adds `SYMBOL_BOOST / (RRF_K + 1)`, with
+`SYMBOL_BOOST = 0.6` — i.e. 60% of one rank-1 RRF step. A partial (camelCase piece)
+match adds half that. **Scaling it to a fraction of a rank-1 step is the whole design**:
+it's decisive among near-ties and can never override genuine agreement between the two
+retrievers.
+
+**6. Identifier query vs. prose query, concretely**
+`handle_refresh_token`: `query_shape` → `identifier` → weights (0.7 dense, 1.4
+lexical). `tokenize` emits `handle_refresh_token` whole plus `handle`/`refresh`/`token`,
+so BM25 hits the exact definition hard. If that chunk's symbol *is* `handle_refresh_token`,
+symbol boost adds a further 0.6/61.
+
+`where do we validate expired sessions`: 6 words, stopwords `where`/`do`/`we` → `natural`
+→ weights (1.3 dense, 0.8 lexical). BM25 struggles because none of those words need
+appear verbatim near the code; the embedding matches code *about* session expiry
+regardless of wording. The weighting shifts trust accordingly.
+
+**7. Candidate pool and √(chunks) scaling**
+The pool is how many candidates each retriever contributes *before* fusion. RRF can
+only rank what retrieval handed it, so too small a pool means the right answer never
+gets considered.
+
+The old rule was a fixed multiple, `top_k * 4` = 40 candidates. The problem is that a
+fixed *count* is a shrinking *fraction* as the corpus grows: **40 candidates is 2.07%
+of a 2,000-chunk index but 0.06% of a 64,000-chunk one.** Same absolute depth,
+drastically less coverage.
+
+So the pool now scales with `√(chunks)`, normalised at `POOL_REFERENCE_CHUNKS = 2000`
+so small repos get exactly the historical numbers. √ rather than linear because you
+want depth to grow with corpus size but far slower — linear would mean 1,280
+candidates at 64k, most of them noise, for no recall gain. Measured cost of depth: a
+dense query is 9.0 ms at 40 candidates, 10.3 ms at 500, 18.3 ms at 1000, so `POOL_MAX
+= 500` is affordable.
+
+**8. What breaks first if the corpus doubles overnight**
+Split ingest from query, because they fail differently.
+
+*Query* is fine. BM25 scoring is ~0.95 ms per 1k chunks for an 8-term query, so
+doubling 64k→128k takes it from ~60 ms to ~120 ms. ANN search barely moves. The
+√-scaled pool absorbs the rest.
+
+*Ingest* feels it first, and the real answer is **resident memory** — ~9.5 MB per 1k
+chunks, held for the life of the server because every chunk's text and BM25's
+per-document dicts stay in RAM. At 128k chunks that's ~1.2 GB for a background
+process. BM25 rebuild is often assumed to be the problem but it's measured at only
+~1.6 s at 64k. Memory is the wall; see D.2.
 
 ---
 
 ## Section C — Project: MCP, Server Design, Systems
 
 **1. What MCP is, plainly**
-Model Context Protocol is a standard way for an AI assistant/agent to
-discover and call external tools — like a defined, structured API contract
-between "the model" and "the world," so any MCP-compatible client (Claude
-Desktop, Claude Code, etc.) can talk to any MCP-compliant server without
-custom integration code per tool. Your server exposes 7 tools; any MCP
-client can connect to it and use those tools without you writing
-client-specific glue code.
+A standard protocol for exposing tools to an AI assistant: the server advertises tool
+names, descriptions and JSON parameter schemas; the client presents those to the model;
+when the model chooses one, the client executes it and returns the result. The value is
+N×M collapse — any MCP client talks to any MCP server without bespoke glue. This server
+exposes 7 tools over plain stdio with no vendor-specific fields, which is why the same
+process serves Claude Code, Cursor, Gemini or a custom client unchanged.
 
-**2. stdio vs. HTTP/SSE transport**
-stdio means the server is spawned as a local subprocess and communicates
-over stdin/stdout — no network socket, no port, no auth layer needed, and it
-naturally lives and dies with the client session. This fits "no daemon, no
-network" directly. The tradeoff: it's single-client, local-machine-only by
-design — you give up the ability to have a persistent server that multiple
-remote clients connect to, and you give up things like built-in
-authentication/authorization that an HTTP server would need anyway for
-remote access.
+**2. stdio vs. HTTP/SSE**
+stdio means the server is a subprocess speaking JSON-RPC over stdin/stdout. No port,
+no socket, no auth layer, and its lifetime is the session's. That fits "no daemon, no
+network" exactly, and it sidesteps authentication entirely because there's no remote
+attack surface.
 
-**3. pickle.load exploit and the restricted unpickler**
-Python's `pickle` format isn't just data — deserializing it can invoke
-arbitrary object constructors, including a `__reduce__` method that can call
-`os.system` or `subprocess` directly. So loading a `.pkl` file from an
-untrusted source is equivalent to executing arbitrary code with your
-process's privileges. A restricted unpickler works by overriding
-`find_class` (the hook pickle uses to resolve which class/function to
-reconstruct) to only allow a small, explicit allowlist of safe types (e.g.
-basic Python builtins, numpy arrays) — anything else raises instead of
-executing. Your doc notes this was "verified against a live `os.system`
-payload," meaning you actually tested that a malicious pickle got blocked,
-not just reasoned about it.
+What you give up: one client per process, local machine only, no shared warm cache
+across users. For a per-developer code-search tool that's the right trade; for a team
+service it wouldn't be.
 
-**4. The seven tools, one sentence each**
-- `search_codebase` — hybrid (BM25 + vector) semantic/lexical search over
-  indexed chunks, returns ranked results with file:line locations.
-- `find_symbol_references` — finds where a given symbol (function/class/etc.)
-  is referenced/used across the indexed codebase.
-- `find_symbol_or_keyword` — live grep-based lookup, always reflects the
-  current on-disk state (never stale relative to the index).
-- `get_chunk_content` — fetches the full text of a specific chunk by ID/location.
-- `get_file_context` — batch-fetches multiple line ranges (e.g. surrounding
-  context) in one call.
-- `rag_status` — reports index health/state (chunk counts, staleness, etc.).
-- `reindex` — triggers a rebuild/update of the index.
+One practical consequence worth mentioning: **stdout belongs to the protocol.** A
+stray `print()` corrupts the JSON-RPC stream and the client just disconnects. That's
+why logging goes to `rag.log` via a `log()` helper, and why every tool is wrapped in a
+`tool_guard` decorator that converts an exception into a readable string return — an
+agent can act on an error message, but a transport fault kills the session.
 
-An agent reaches for `find_symbol_or_keyword` over `search_codebase` when it
-needs guaranteed-fresh results (e.g. right after a file was just edited and
-might not be reindexed yet) or an exact-match lookup rather than a ranked
-semantic search.
+**3. `pickle.load` and the restricted unpickler**
+A pickle is a program for a small stack machine, not a data format. The `REDUCE`
+opcode calls a callable with arguments, and `__reduce__` lets an object specify any
+callable — `os.system`, `subprocess.Popen`. So unpickling attacker-controlled bytes is
+arbitrary code execution with your process's privileges.
 
-**5. Why live grep instead of indexed lookup for that tool**
-It trades completeness/speed for freshness guarantees. The vector+BM25 index
-can be stale relative to disk (until the next `reindex`/sync), so a tool
-whose entire purpose is "never wrong about what's on disk right now" has to
-bypass the index and hit the filesystem directly. The cost is that grep is
-slower and less structured than an indexed lookup at large scale, so it's
-used selectively, not as the default search path.
+`RestrictedUnpickler` subclasses `pickle.Unpickler` and overrides **`find_class`**, the
+single hook pickle uses to resolve a module/name pair into a callable. Only 10
+allowlisted entries resolve — `rank_bm25`'s BM25 classes, numpy's array reconstructors,
+a few collections types, and safe builtins. Anything else raises `UnpicklingError`
+*before a single object is constructed*.
+
+Why it's the right fix here: loading a legitimate index is byte-for-byte identical work,
+so it costs nothing, while the alternative (migrating off pickle entirely) is a rewrite.
+Verified by pickling an object whose `__reduce__` returned `(os.system, ("touch PWNED",))`
+— plain `pickle.load` created the file, `load_index_file` refused and it did not.
+
+**4. The seven tools, and when each wins**
+- `search_codebase` — hybrid dense+BM25 search, RRF-fused. The default for "where/how
+  is X implemented?"
+- `find_symbol_references` — where a symbol is **defined** and where it's **used**;
+  word-boundary matched, definitions ranked above call sites above mentions, and a
+  "zero references" answer is re-checked against a live grep so a stale index can't
+  produce a false negative.
+- `find_symbol_or_keyword` — literal/regex grep of the working tree, paginated.
+- `get_chunk_content` — full verbatim body behind a search hit, by chunk id.
+- `get_file_context` — exact line ranges from many files in one call.
+- `rag_status` — index health and staleness.
+- `reindex` — refresh after edits.
+
+`find_symbol_or_keyword` over `search_codebase` when you need a **guaranteed** answer
+rather than a ranked one: proving a string exists or definitively does not (a feature
+flag, a column name, a TODO), or right after an edit the index hasn't absorbed. Ranked
+search can't prove a negative; grep can.
+
+**5. Why that tool is live grep rather than indexed**
+Its entire purpose is being un-stale. The index is a snapshot; a tool that answers
+"does this string exist right now" has to hit the filesystem. It prefers `ripgrep` and
+falls back to POSIX `grep` so it works on a bare machine, with a configurable timeout
+(`RAG_GREP_TIMEOUT`, 30 s) and a message that names which tool ran — because the POSIX
+fallback is the one that actually times out on a big repo.
 
 **6. Why batch line-range fetching**
-Without batching, an agent context that needs 5 different code regions would
-issue 5 separate tool calls — 5 round trips, 5x the overhead, and 5x the
-opportunity for one of them to fail. Batching into one `get_file_context`
-call reduces tool-call overhead and keeps the agent loop shorter (fewer
-iterations to gather the same context), which matters a lot once you're
-budgeting loop iterations in the harness.
+Five regions of interest would otherwise be five tool calls: five round trips, five
+model turns, and five chances for one to fail. `get_file_context` takes a list of
+`{path, start_line, end_line}` and returns them all at once, which shortens the agent
+loop rather than just saving bytes. Since `search_codebase` already returns exact line
+ranges, the natural pattern is search once, then fetch every interesting range in a
+single follow-up.
 
-**7. What rag_status is for**
-Likely reports things like chunk/file counts, last ingest time, whether the
-index appears stale relative to disk, and possibly per-repo breakdown in the
-multi-repo setup. It matters for both a human debugging ("is my index even
-up to date?") and potentially for an agent to self-check before trusting
-retrieval results in a task where staleness would be costly (e.g. before a
-code edit).
+**7. What `rag_status` reports, and why it exists**
+Repository, indexed file and chunk counts, embedding model, chunker version,
+build time, per-repo indexed commits, language breakdown, vector count, whether token
+counting is exact, the fusion constants, candidate-pool depth, the path-pushdown limit,
+whether a reranker is loaded, and which files have changed on disk since the ingest.
 
-**8. reindex vs. initial --full ingest**
-`--full` almost certainly does a from-scratch build (clear and rebuild
-everything). `reindex` is likely the incremental path — using the SHA-1
-checkpointing to only re-process files that changed, add/update/delete their
-chunks, and rebuild BM25 (globally, since that part isn't incremental yet)
-without redoing embedding work for unchanged files. Confirm this distinction
-against the actual CLI flags/functions in `ingest_codebase.py`.
+Why it matters: retrieval fails *silently*. A stale index returns plausible, wrong
+answers with no error. `rag_status` — plus the `[index staleness]` banner appended to
+results — turns a silent failure into a visible one. The design principle is that a
+system which can be quietly wrong must be able to report on itself.
 
-**9. Why SHA-1 for checkpointing, not timestamp/line count**
-A file's mtime can change without content changing (touch, checkout, clone),
-which would cause unnecessary re-processing — or worse, a tool/CI step might
-not preserve mtimes at all, silently causing missed updates. Line count is
-even weaker — two completely different file contents can have the same line
-count. A content hash (SHA-1) is the only one of the three that's an exact,
-tamper-proof proxy for "has this file's content actually changed," which is
-what checkpointed resume needs to be correct.
+**8. `reindex` vs. `--full`**
+`reindex()` shells out to `ingest_codebase.py`, adding `--full` only if asked. Default
+is incremental: walk, SHA-1 each file, reuse chunks for unchanged files, re-chunk and
+re-embed only changed ones, delete vectors for removed files, rebuild BM25 globally,
+rewrite the index. `--full` discards the previous state and re-embeds everything. Full
+is also *forced automatically* when the embedding model or chunker version changed, or
+when Chroma's vector count disagrees with the index — because those mean the existing
+vectors can't be trusted.
 
-**10. The multi-repo hook bug — root cause and lesson**
-Root cause: the hook body was written to always re-index "the repo it fired
-in" without properly scoping which repo's chunks should be affected — so
-when a hook fired for repo A, the indexing logic ended up deleting chunks
-belonging to repos B and C as a side effect (likely because the index-clear
-step or a `--full`-style path wasn't scoped by repo). The general lesson:
-any operation that clears/rebuilds shared state needs to be explicitly scoped
-to exactly what changed — implicit "the current context" scoping is a common
-source of destructive bugs whenever the system is used in more than one
-context simultaneously. This is a great example to have ready for "tell me
-about a bug you fixed" — it has clear cause, clear blast radius, and a clear
-generalizable lesson.
+**9. Content hashing and checkpointing — two mechanisms, don't conflate them**
+There are two, and interviewers will probe the difference.
 
-**11. Path pushdown and the cap increase**
-"Path pushdown" here means filtering candidates by file path *before* (or
-as part of) the vector/BM25 search rather than searching everything and
-filtering after — this matters when a query is scoped to a subdirectory or
-specific repo. The cap (400 → 10,000) was a safety limit on how many path
-values could be pushed down as a filter; your doc's reasoning is that this
-was measured (empirically) to be far more conservative than ChromaDB
-actually needs (32k values in 34ms), and that above the old cap, filtering
-was silently falling back to fetching everything and post-filtering in
-Python — much slower and easy to not notice was happening.
+*Incremental manifest.* Each file's SHA-1 is stored with its chunk ids. Why content
+hash rather than mtime: mtime changes without content changing on every clone,
+checkout or `touch`, causing needless re-embedding — and worse, some tooling doesn't
+preserve mtimes at all, which would silently *miss* updates. Line count is weaker
+still; two completely different files trivially share one.
 
-**12. Git hooks vs. sync_and_index.sh**
-Hooks (e.g. post-checkout, post-merge) automatically trigger re-indexing on
-git operations, keeping the index fresh without the developer remembering to
-run anything. `sync_and_index.sh` is a manual/scheduled daily-workflow script
-that pulls all repos and indexes once. They're described as "optional
-belt-and-braces" because the daily script alone is sufficient for staying
-reasonably fresh — hooks are a nice-to-have for immediacy, not a
-correctness requirement, now that there's a reliable manual/scheduled path.
+*Crash resume.* Embeddings were always durable — Chroma upserts per batch. What was
+written only at the very end was the **bookkeeping**. So a crash left a store full of
+finished work that the next run couldn't account for, hit the "counts disagree →
+rebuild" rule, deleted every vector and started over. The embeddings survived; the
+knowledge that they existed didn't. Now the manifest plus the set of embedded ids is
+checkpointed every 20 batches.
+
+The subtlety worth volunteering: **resume is gated on the file's SHA-1, not on chunk
+ids alone.** Ids encode line numbers, so an edit usually changes them — but an in-place
+edit preserving line count would leave ids identical while the content differs, and
+resume would skip a chunk that needed re-embedding. Verified: 320 chunks embedded
+before a kill, exactly 315 skipped after editing one 5-chunk file.
+
+**10. The multi-repo bug — actual root cause**
+`hooks/rag-reindex.sh` resolved its target with `git rev-parse --show-toplevel`. Inside
+a git hook that returns **the repo being committed to**, not the workspace root. So a
+commit in repo B ran a perfectly correct ingest — scoped to repo B alone. The ingest
+rebuilds its manifest from the filesystem walk, so every file in repos A and C was
+absent from the walk, therefore classified as removed, therefore their chunks and
+vectors were deleted. Caught by a three-repo test: a commit in `beta` cut the index
+from 5 chunks across 3 repos to 2 chunks across 1. Fixed by asking `rag_config` for the
+workspace root instead.
+
+The generalisable lesson, and it's a good one to have ready: **the bug wasn't in the
+deletion logic, it was in the question being asked.** Every individual step was
+correct; the input was scoped wrong. Anything that reconciles state against a scan is
+only as correct as the scan's boundary — "what's missing from this walk" silently
+means "delete it."
+
+**11. Path pushdown and the 400 → 10,000 cap**
+Pushdown means the path filter goes into ChromaDB's query as a `$in` clause, so the ANN
+search only considers matching files. The alternative — fetch the global top-N then
+discard non-matching — starves: if your filter matches 10% of the repo, ~90% of a
+40-candidate pool evaporates.
+
+The cap decides when pushdown is used. It was 400, chosen by assumption. Measured:
+Chroma resolves 400 values in 8 ms, 10,000 in 13 ms, 32,000 in 34 ms, and only fails
+past ~40,000 on SQLite's variable limit. So the cap was ~80× more conservative than the
+engine needs, and every filter above it fell back to post-filtering **silently** —
+precisely on the repos big enough for pushdown to matter. On a 4,000-file repo any
+filter covering more than a tenth of the tree crossed it.
+
+Two lessons: measure the resource before trusting the constant that guards it, and make
+degradation visible — the search header now says `POST-filtered` when it happens.
+
+**12. Git hooks vs. `sync_and_index.sh`**
+Hooks (`post-merge`, `post-commit`, `post-checkout`, `post-rewrite`) re-index after git
+operations, installed into **every** repo in the workspace and chained ahead of any
+pre-existing hook rather than overwriting it. `sync_and_index.sh` is the manual path:
+fast-forward every repo, skip any with uncommitted work, then index once.
+
+Hooks are "belt-and-braces" because the realistic workflow is pull-everything-then-work,
+which the manual script covers, and hooks add latency to every `git pull` for freshness
+you rarely need mid-session. Both exist because they fail differently: hooks catch what
+you forget, the script catches what hooks miss (uncommitted edits, repos where hooks
+weren't installed).
+
+**13. Why must the index artifacts never be committed?**
+`rag_index.pkl` and `chroma_db/` contain the **verbatim source text** of every chunk —
+the index stores chunk bodies so results can be returned without re-reading files.
+Committing them to a public repo publishes the code you indexed, in a form nobody
+thinks to review because it looks like a binary blob. They're gitignored, and they
+rebuild from scratch in one command, so there is no upside to tracking them. This is a
+good answer to have because it shows you think about the data a system *retains*, not
+just what it computes.
 
 ---
 
 ## Section D — Project: Scale, Failure Modes, Tradeoffs
 
 **1–2. Failure order: memory → symbol scan → BM25 → whole-index rewrite**
-- **Memory** goes first because both the vector index and BM25 postings are
-  kept resident, and resident memory grows roughly linearly (or worse, with
-  overhead) with chunk count — this is the most basic, least algorithmically
-  interesting bottleneck, which is exactly why it hits first.
-- **Symbol scan** next — likely a linear or near-linear scan over all known
-  symbols for reference-finding; fine at thousands of symbols, increasingly
-  slow as the symbol table grows without an index structure over symbols
-  themselves.
-- **BM25** next — it's rebuilt *globally* on every ingest (not incremental),
-  so its rebuild cost grows with total corpus size regardless of how much
-  actually changed; at large scale this rebuild time dominates ingest time.
-- **Whole-index rewrite** last/worst — if the underlying storage format
-  requires a full rewrite for any update (rather than incremental
-  insert/update), this is the most expensive operation and the one that
-  eventually forces an architecture change (which is exactly why SQLite
-  migration is flagged as the fix once you cross that threshold).
+All four are linear in chunk count; they differ in constant factor, which is what sets
+the order. Measured per 1,000 chunks:
 
-**3. Why BM25 isn't incremental today**
-An incremental BM25 update would require updating inverted-index postings
-lists and corpus-wide statistics (document frequency, average document
-length) that every score calculation depends on — adding or removing a
-single document changes IDF for every term it contains, in principle. Doing
-this correctly incrementally is more complex than full rebuild; most simple
-BM25 implementations (including likely yours) just accept O(rebuild) cost
-because it's simpler and, at current scale (1.6s at 64k), still cheap enough
-not to matter yet.
+| Bottleneck | Cost / 1k chunks | Why it degrades |
+|---|---|---|
+| Resident memory | **9.5 MB** | Every chunk's text *and* skeleton *and* BM25's per-document frequency dict stay in RAM for the server's life |
+| `find_symbol_references` | 3.7 ms | Regex `findall` over **every** chunk's text — no index over symbols exists |
+| BM25 scoring | 0.95 ms | `rank_bm25` does a Python-level dict lookup per document per query term |
+| Index rewrite | 7 ms | The entire pickle is re-serialised even for a one-file change |
 
-**4. The ×1.28 tiktoken→bge ratio**
-Different tokenizers (OpenAI's tiktoken BPE vocabulary vs. the tokenizer
-`bge-small-en-v1.5` actually uses, likely a BERT-style WordPiece vocabulary)
-segment the same text into different numbers of tokens because they have
-different vocabularies and merge rules. You can't reuse a tiktoken count
-directly for capacity planning against a BGE-based model — you have to
-either measure the ratio empirically on representative text (which is what
-your doc's number implies happened) or re-tokenize with the actual target
+Memory is first because it's a hard wall, not a slowdown: at ~1M chunks it's ~9.5 GB
+resident for a background process, and there is no graceful degradation. Symbol scan is
+next because 3.7 ms/1k is the largest per-query constant — ~3.7 s at 1M chunks. BM25 is
+4× cheaper per unit. The rewrite is last because it's off the query path — but it's the
+one that breaks the *promise* of incremental indexing, since a one-line edit pays for
+the whole index.
+
+**3. Why BM25 isn't incremental**
+Adding one document changes corpus-wide statistics — document frequency for every term
+it contains, the average document length, hence every score. Maintaining that
+incrementally means updating postings lists and IDF in place, which is what a real
+inverted index (Lucene, SQLite FTS5, Tantivy) is built to do. `rank_bm25` isn't an
+inverted index at all, so a rebuild is the only correct option. It's measured at ~1.6 s
+at 64k chunks, so the simplicity is worth it today — and it's on the list for exactly
+when it won't be.
+
+**4. The ×1.28 tiktoken → bge ratio**
+Different tokenizers, different vocabularies. tiktoken's `cl100k_base` is a 100k-token
+BPE tuned on general web text; bge-small uses BERT-style **WordPiece with a ~30k
+vocabulary**, which fragments code harder because it lacks the code-specific merges.
+Measured on a real corpus: 225,616 tiktoken tokens → 288,820 bge tokens, **×1.28
+overall**, ranging from ×1.04 (CSS) to ×1.53 (SQL) by language.
+
+The practical point: token counts are **not portable**. Capacity planning done in
+tiktoken and applied to a BGE model under-counts by ~28%, which silently blows a chunk
+budget. Either measure the ratio on representative text or re-tokenize with the target
 tokenizer.
 
-**5. Why divide by observed mean tokens/chunk, not sliding-window stride**
-Your chunks are syntax-aware and variable-length (a one-line function vs. a
-50-line class), not fixed-size windows — so a sliding-window estimate
-(`total_tokens / window_size`) would implicitly assume uniform chunk size,
-which is false here. Dividing by the *empirically observed* mean tokens per
-chunk correctly accounts for your chunker's actual size distribution. Your
-doc notes this produces ~4x more chunks than a naive sliding-window estimate
-— meaning your real chunks are meaningfully smaller on average than a
-generic window would predict (consistent with syntax-aware chunking often
-producing many small chunks, e.g. short functions, rather than uniform-size
-blocks).
+**5. Why divide by observed mean tokens/chunk, not a window stride**
+A sliding-window estimate is `total_tokens / stride`, which assumes every chunk is the
+window size. Syntax-aware chunks are wildly variable — measured **mean 148 tokens,
+median 90, against a 440 ceiling**, i.e. only 34% average budget utilisation, because a
+three-line property declaration is its own chunk.
 
-**6. Why SQLite migration was declined for now**
-Premature — the current pickle+Chroma approach works fine below the
-identified threshold (~30k+ files triggers the concern per your doc), and
-migrating storage backends is real engineering effort with real risk. The
-explicit trigger for revisiting it (per your doc): above ~50k chunks or
-200MB index size. This is a good example of deliberately *not* over-engineering
-— worth stating explicitly in an interview as evidence of judgment, not
-just as a fact.
+So you divide by the *observed* mean. Doing it the naive way for a 6.2M-token corpus
+predicted ~14,000 chunks; the real figure is ~58,000 — **4× off**, and every downstream
+estimate (memory, ingest time, index size) inherits that error. Worth stating plainly:
+the estimate was wrong in the direction that matters, i.e. optimistic.
+
+**6. Why the SQLite migration was declined**
+Because the trigger cited for it was ~30k+ files and the actual corpus was 161 files /
+1,930 chunks / 2.9 MB. The *security* half of the argument (pickle = code execution)
+was real and got fixed at zero runtime cost with the restricted unpickler. The *memory*
+half is a genuine rewrite that would also slow scoring.
+
+The explicit revisit trigger: **>50k chunks, or an index past ~200 MB, or `_load_index`
+becoming visible in tool latency.** And the right move then isn't "SQLite instead" but a
+split — chunk *text* in SQLite read on demand for the ~10 hits actually returned, BM25
+postings staying resident. Loading 50k chunk bodies to display 10 is the waste worth
+attacking. This is a good judgment answer: it's not "no", it's "not yet, and here's the
+number."
 
 **7. Why hand-written extractors for Dart/SQL/Markdown**
-Generic Tree-sitter-based chunking assumes a "normal" programming-language
-structure (functions/classes as the natural unit). Markdown has no such
-structure (headings/sections aren't "functions"), SQL's meaningful units
-(statements, schema objects) don't map cleanly onto a generic code-parsing
-heuristic, and Dart apparently has structural quirks the generic path
-mishandles. "Mis-parses" concretely means the generic path would produce
-chunks that split mid-statement, or fail to identify natural break points —
-hand-written extractors encode the actual structure of each of those formats
-instead of forcing a code-shaped heuristic onto non-code-shaped content.
+Because the generic path measurably produces worse chunks, and each failure is
+specific:
+- **SQL** — grammars swallow dollar-quoted function bodies, fusing an entire migration
+  file into one `statement` node. `_split_sql()` re-splits on top-level DDL keywords so
+  each policy/function stays individually addressable.
+- **Dart** — declarations lead with the return type, so the generic "first identifier"
+  heuristic yields `Future` instead of the method name. `_dart_symbol()` fixes it. Dart's
+  grammar also emits signature and body as siblings, so they're rejoined explicitly.
+- **Markdown** — its value is heading-bounded sections, not its AST; `_extract_markdown()`
+  splits on headings.
+
+"Mis-parses" means wrong symbol names and fused chunks — a regression you'd measure in
+the symbol column, not a stylistic preference.
 
 **8. Why the reranker is opt-in**
-A reranker is typically a second-stage model (often a cross-encoder) that
-re-scores the top candidates after initial retrieval for higher precision —
-but that requires either loading an additional model (more memory, more
-startup time) or, in some implementations, calling an external API (which
-would violate offline operation entirely). Making it opt-in via
-`RAG_RERANKER` preserves the default "100% offline, no extra dependency"
-guarantee while letting a user who wants better precision (and is willing
-to pay latency/memory cost) turn it on explicitly.
+A cross-encoder scores query and chunk *together* rather than comparing two independent
+embeddings, which is where top-3 precision lives. Be accurate about the cost: it's
+`fastembed`'s `TextCrossEncoder` running **locally as ONNX**, so it is not an API call
+and doesn't break offline operation at query time. What it does require is a **one-off
+model download**, which breaks the guarantee that a fresh clone works with no network.
 
-**9. "How would you scale this 10x" — grounded answer**
-Not "add more RAM" — the grounded answer is: migrate storage to SQLite
-(FTS5 for BM25 + chunk text on disk instead of resident) before hitting the
-~50k chunk / 200MB threshold, since that's the already-identified next
-bottleneck; consider `bge-base` for quality if latency budget allows;
-evaluate sharding per-project rather than one global index, since your
-doc's own alternative to SQLite migration is "shard per project" — this
-also naturally bounds symbol-scan cost per shard. The key interview point:
-you're not guessing, you already measured where it breaks and already wrote
-down the fix.
+Hence opt-in via `RAG_RERANKER`: unset changes nothing; set-but-uncached logs the reason
+and falls back to the fused RRF order rather than failing the search. At the projected
+work scale — 48–64k chunks in a crowded 384-dimensional space — it's the first thing
+you'd turn on.
 
-**10. What's NOT yet in the handoff doc — a "further work" answer**
-A strong honest answer here is something like: BM25 rebuild latency under
-concurrent ingests (what happens if two `reindex` calls or a hook and a
-manual sync overlap?), or retrieval quality degradation specifically (not
-just latency/memory) as symbol name collisions become more likely at scale
-across many repos. Being ready to name a real, specific unknown — rather
-than claiming everything's covered — is itself a strong signal.
+**9. "Scale it 10×" — the grounded answer**
+Not "add RAM". In order, and each already measured:
+1. Move chunk **text** out of the resident index into SQLite keyed by chunk id, read
+   on demand for the ~10 hits returned. That's most of the 9.5 MB/1k.
+2. Build a `symbol → chunk_ids` map at ingest, turning the 3.7 ms/1k full scan into a
+   dict lookup.
+3. Replace `rank_bm25` with **SQLite FTS5** — BM25 on disk, near-zero resident memory,
+   same dependency, no daemon. This collapses the memory, scoring and rewrite problems
+   together.
+4. Shard per project (`RAG_INDEX_DIR` + `RAG_COLLECTION` per client entry). Ten 100k
+   indexes behave far better than one 1M index, and it matches how people actually
+   search a monorepo.
+
+The interview point isn't the list — it's that each item is attached to a measured cost
+and a threshold, so you're sequencing work rather than guessing.
+
+**10. A failure mode not yet in the doc**
+Answer honestly with something specific. Good candidates: concurrent ingests (a hook and
+a manual sync overlapping — the index write is atomic via `os.replace`, but two
+processes embedding simultaneously would duplicate work and the second write silently
+wins); or **retrieval quality** degradation as opposed to latency — as the corpus grows,
+symbol-name collisions across repos become likelier, and nothing currently measures
+whether precision@10 is dropping, because there's no eval set big enough to detect it.
+
+That second one is the better answer, because it names the gap the whole of Section H
+is about: everything measured so far is *performance*, and almost nothing is *quality*.
+
+**11. A bug where the code asked the wrong question**
+Pair this with C.10 — same shape, and having two makes the lesson look like a pattern
+you recognise rather than a one-off.
+
+`_detect_repo_root()` called `git rev-parse --show-toplevel` on the workspace directory
+to find the repository to index. That worked for as long as the workspace was never
+itself a git checkout. When it became one — the workspace is now distributed as a repo
+you clone into a project — git correctly answered "the workspace", so the indexer would
+have indexed the retrieval tooling instead of the code. And it would have failed
+*silently*: `rag-workspace` is in `EXCLUDE_DIRS`, so the result is a near-empty index,
+not an error. Fixed by asking about the **parent** directory, which is what it always
+meant.
+
+Both bugs share a root: a call that was correct under an unstated assumption, which
+stopped holding when the deployment shape changed.
 
 ---
 
@@ -514,14 +664,29 @@ any one topic poorly, and also waste context budget when injected into a
 prompt. The right size depends on the content's natural unit of meaning
 (which is exactly why syntax-aware chunking beats fixed-size for code).
 
-**8. Chunk overlap — why, and why not for code**
-Overlap (e.g. each chunk shares its last N tokens with the next chunk's
-start) helps prevent meaning from being lost exactly at a chunk boundary in
-unstructured prose, where sentences/ideas can span an arbitrary cut point.
-For code with syntax-aware chunking, boundaries are already placed at
-meaningful structural edges (function/class boundaries) — adding overlap
-there mostly just duplicates content and adds noise/redundancy without the
-same boundary-loss problem overlap solves in prose.
+**8. Chunk overlap — why, and when code still needs it**
+Overlap (each chunk sharing its last N tokens with the next chunk's start) exists
+to stop meaning being lost exactly at a boundary in unstructured prose, where an
+idea can span an arbitrary cut point.
+
+The interesting answer for code is that it depends on **why** the boundary is there,
+and this system does both:
+
+- **Between whole symbols — no overlap.** The boundary is a real structural edge;
+  one function ending and another beginning loses nothing. Overlap here would just
+  duplicate content and inflate the index.
+- **Where a symbol was *split* because it exceeded the token budget — overlap.**
+  That cut is arbitrary, exactly like the prose case, so `_split_oversized` carries
+  ~12% of the budget (max 3 lines) into the next piece, so a split symbol stays
+  findable from either side.
+- **Where the parser claimed nothing** (imports, top-level code, parse errors) —
+  overlap, because window boundaries there are arbitrary too: `GAP_OVERLAP = 8`
+  lines out of a `GAP_WINDOW = 40`.
+
+Measured, chunk text totals **108% of corpus bytes** — that 8% is the deliberate
+seam. Saying "code doesn't need overlap" is the common answer and it's half right;
+the precise version is that *structural* boundaries don't need it and *arbitrary*
+ones do.
 
 **9. Embedding drift and reindexing**
 "Embedding drift" refers to the fact that vectors from different embedding
@@ -578,8 +743,10 @@ Tokenization splits text into subword units from a fixed vocabulary learned
 during that model's training (commonly via BPE or similar algorithms).
 Different models train different vocabularies on different data, so the same
 string segments differently — this is exactly the ×1.28 tiktoken→bge ratio
-issue from Section D.4: you cannot assume token counts are portable across
-models/tokenizers.
+from Section D.4 — measured, not assumed: a 100k-token BPE vocabulary and a 30k
+WordPiece one segment the same code very differently (×1.04 on CSS, ×1.53 on SQL).
+Token counts are not portable across tokenizers, and treating them as portable
+silently blows whatever budget you planned against.
 
 **6. Why hallucination happens**
 The model is a next-token predictor trained to produce plausible-sounding
@@ -716,7 +883,7 @@ if there's a known correct answer format — plus explicitly checking
 faithfulness (does the answer's claims trace back to the retrieved
 context) separately from correctness.
 
-**3. Golden set and why 8 queries isn't enough**
+**3. Golden set and why 8 queries isn't enough** *(your own gap — own it)*
 A golden/labeled set is a fixed collection of representative queries with
 known-correct (or human-graded) expected results, used to measure and track
 retrieval/answer quality consistently over time. 8 queries is a fine
@@ -774,12 +941,14 @@ that the harness itself doesn't also have.
 
 ## Section I — Harness & Loop
 
-Fill this in once the loop is built — these answers should come from your
-own design, not a template. Use the questions in the companion doc as a
-checklist while you build, and write your answers here (or directly from
-memory) once it's working. This section deliberately has no pre-written
-answers: if you can answer these fluently from your own implementation,
-that's the strongest signal in the whole interview.
+**Deliberately blank.** These answers have to come from your own design, and a
+pre-written template here would actively hurt you — this is the section where an
+interviewer can tell instantly whether you built the thing or read about it.
+
+Use the questions in the companion doc as a build checklist, and write your answers
+here as you go rather than afterwards, while you still remember why you rejected the
+alternatives. The detail that lands in an interview is never the final design; it's
+the thing you tried first that didn't work.
 
 ---
 
