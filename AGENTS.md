@@ -22,8 +22,6 @@ Two copies drift, and the stale one is the one that gets followed.
 
 ---
 
----
-
 ## Local Codebase RAG (MCP server `codebase-rag`)
 
 100% local and offline: tree-sitter chunking → ONNX embeddings → ChromaDB (dense)
