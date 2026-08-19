@@ -61,6 +61,7 @@ Register it with any MCP-capable client as a stdio server:
 | **`create_rag.md`** | The runbook. A complete, self-contained build guide — survey the target repo, write each file, wire up the client, verify. Hand it to an agent or follow it yourself. |
 | [`docs/architecture.html`](docs/architecture.html) | A ten-slide visual explainer of how the whole thing works — the pipeline, chunking, hybrid search, rank fusion, and where it breaks at scale. Open it in a browser. |
 | `skills/rag/SKILL.md` | An interactive, one-step-at-a-time setup skill for agents that support skills. |
+| [`AGENTS.md`](AGENTS.md) | A project-agnostic agent-instructions template. Copy it into your project's **root** as `CLAUDE.md` / `GEMINI.md` / `AGENTS.md` so the assistant knows the tools exist and reaches for them before `grep`. |
 | `rag_config.py` | Single source of truth: paths, model, exclusions, tokenizer, repo discovery. Everything overridable by env var. |
 | `rag_chunker.py` | Tree-sitter structure-aware chunking with exact line ranges, token-budget splitting, gap filling. |
 | `ingest_codebase.py` | Incremental, checkpointed indexer (SHA-1 manifest) → ChromaDB + BM25 → `rag_index.pkl`. |
