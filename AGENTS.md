@@ -1,13 +1,26 @@
-# Agent instructions — template
+# Agent instructions
 
-Copy this into the **root** of the project you are indexing, as `CLAUDE.md`,
-`GEMINI.md`, `AGENTS.md`, or whatever your assistant reads. It has to live at the
-project root, not in `rag-workspace/`: assistants load the root file at session
-start and subdirectory files only when they touch that subtree, so a copy left in
-here is loaded exactly when you don't need it.
+What an AI assistant needs to know to actually use this retrieval server: the seven
+tools, when to reach for each, and how index freshness works. Nothing below is
+specific to any project or any assistant.
 
-Nothing below is specific to any project or any assistant. Delete the sections you
-don't want; the tool descriptions are the part that earns its keep.
+**This has to reach your assistant's ROOT instruction file.** Assistants load the
+project-root file at session start and a subdirectory file only when they touch that
+subtree — so this file sitting here, unreferenced, is read exactly when it is not
+needed and stays silent when it is. Two ways to wire it up:
+
+**Import it** (preferred — one copy, so it cannot drift). In your project-root
+`CLAUDE.md` / `GEMINI.md` / `AGENTS.md`:
+
+```markdown
+@rag-workspace/AGENTS.md
+```
+
+**Or paste it** if your assistant has no import syntax. Copy everything below the
+rule into that root file, and re-copy it after a `git pull` that changes this file.
+Two copies drift, and the stale one is the one that gets followed.
+
+---
 
 ---
 
