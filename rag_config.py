@@ -17,6 +17,18 @@ import pickle
 import re
 import subprocess
 
+# Several dependencies (fastmcp, fastembed, tree-sitter-language-pack) floor at
+# Python 3.10. macOS ships /usr/bin/python3 as 3.9, so the natural
+# `python3 -m venv` builds an environment where the install fails with
+# "No matching distribution found for fastmcp" -- a message that never mentions
+# the interpreter. If a 3.9 environment reaches this far anyway, say why.
+if sys.version_info < (3, 10):
+    raise RuntimeError(
+        "This project requires Python 3.10 or newer; this interpreter is %s "
+        "(%s). Recreate the virtualenv naming the interpreter explicitly, e.g. "
+        "`python3.12 -m venv rag-workspace/.poc-venv`."
+        % (".".join(map(str, sys.version_info[:3])), sys.executable))
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------

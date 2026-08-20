@@ -20,7 +20,9 @@ Updating is `git pull`.
 cd <the project you want to index>
 git clone https://github.com/bornohin/rag-builder.git rag-workspace
 
-python3 -m venv rag-workspace/.poc-venv
+# Name the interpreter explicitly: macOS ships /usr/bin/python3 as 3.9, which
+# is below the 3.10 floor, and pip's error does not say so.
+python3.12 -m venv rag-workspace/.poc-venv
 rag-workspace/.poc-venv/bin/pip install -r rag-workspace/requirements.txt
 rag-workspace/.poc-venv/bin/python3 rag-workspace/download_model.py   # ~4s from the release asset
 rag-workspace/.poc-venv/bin/python3 rag-workspace/ingest_codebase.py --full
@@ -90,7 +92,7 @@ publishes the code you indexed. They rebuild from scratch in one command.
 
 ## Requirements
 
-Python 3.9+, `git` (optional), ~500 MB of disk for the virtualenv and model weights,
+Python **3.10+**, `git` (optional), ~500 MB of disk for the virtualenv and model weights,
 and one network fetch during setup to install packages and cache the model. After
 setup, nothing phones home.
 

@@ -1,7 +1,13 @@
 # Local codebase RAG — everything runs offline, in user space, no sudo.
-fastmcp>=2.0
+#
+# Requires Python >= 3.10. Note that macOS ships /usr/bin/python3 as 3.9, so
+# `python3 -m venv` there produces a venv that cannot install these at all --
+# and pip reports it as "No matching distribution found for fastmcp", which
+# does not obviously mean "wrong interpreter". Create the venv with an explicit
+# interpreter: `python3.12 -m venv ...`.
+fastmcp>=2.0            # requires-python >=3.10
 chromadb>=0.5
-fastembed>=0.4
+fastembed>=0.4          # requires-python >=3.10
 rank-bm25>=0.2.2
 tree-sitter>=0.23
-tree-sitter-language-pack>=0.7
+tree-sitter-language-pack>=0.7   # requires-python >=3.10

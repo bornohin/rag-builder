@@ -24,7 +24,9 @@ repository, a vendor, or a model.
 - The workspace is self-contained and indexes its **parent** directory, so it can be
   its own git checkout dropped into any project without disturbing that project's tree
 
-**Requirements.** Python 3.9+, `git` (optional but recommended), ~500 MB disk for the
+**Requirements.** Python **3.10+** (`fastmcp`, `fastembed` and `tree-sitter-language-pack`
+all floor there; macOS's `/usr/bin/python3` is 3.9, so name the interpreter explicitly
+when creating the venv), `git` (optional but recommended), ~500 MB disk for the
 virtualenv and model, and one network fetch during setup to install packages and cache
 the model weights. After setup, nothing phones home.
 
@@ -122,12 +124,18 @@ Create `<WORKSPACE>/requirements.txt`:
 
 ```text
 # Local codebase RAG — everything runs offline, in user space, no sudo.
-fastmcp>=2.0
+#
+# Requires Python >= 3.10. Note that macOS ships /usr/bin/python3 as 3.9, so
+# `python3 -m venv` there produces a venv that cannot install these at all --
+# and pip reports it as "No matching distribution found for fastmcp", which
+# does not obviously mean "wrong interpreter". Create the venv with an explicit
+# interpreter: `python3.12 -m venv ...`.
+fastmcp>=2.0            # requires-python >=3.10
 chromadb>=0.5
-fastembed>=0.4
+fastembed>=0.4          # requires-python >=3.10
 rank-bm25>=0.2.2
 tree-sitter>=0.23
-tree-sitter-language-pack>=0.7
+tree-sitter-language-pack>=0.7   # requires-python >=3.10
 ```
 
 Install:
@@ -194,6 +202,18 @@ import sys
 import pickle
 import re
 import subprocess
+
+# Several dependencies (fastmcp, fastembed, tree-sitter-language-pack) floor at
+# Python 3.10. macOS ships /usr/bin/python3 as 3.9, so the natural
+# `python3 -m venv` builds an environment where the install fails with
+# "No matching distribution found for fastmcp" -- a message that never mentions
+# the interpreter. If a 3.9 environment reaches this far anyway, say why.
+if sys.version_info < (3, 10):
+    raise RuntimeError(
+        "This project requires Python 3.10 or newer; this interpreter is %s "
+        "(%s). Recreate the virtualenv naming the interpreter explicitly, e.g. "
+        "`python3.12 -m venv rag-workspace/.poc-venv`."
+        % (".".join(map(str, sys.version_info[:3])), sys.executable))
 
 # ---------------------------------------------------------------------------
 # Paths
