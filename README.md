@@ -194,6 +194,13 @@ textbook RRF — useful as a baseline when measuring a retrieval change.
   and no warning; and a hook that re-indexes the repo it fired in — rather
   than the workspace root — silently deletes every other repo's chunks.
   `rag_status()` prints the indexed commit per repo so drift is visible.
+- **Nothing phones home.** ChromaDB ships anonymised product telemetry enabled
+  by default; both the indexer and the server build their client through
+  `rag_config.chroma_client()`, which turns it off. For a tool whose premise is
+  that the codebase never leaves the machine, that default was simply wrong —
+  and on a locked-down network an outbound telemetry post is a hang waiting to
+  happen. Verified: search and status run with every outbound connection
+  blocked at the proxy level.
 - **Staleness is surfaced, never hidden.** Every result carries a warning when
   indexed files have changed on disk, and negative answers are confirmed
   against a live grep.

@@ -495,6 +495,23 @@ RERANKER_MODEL = os.environ.get("RAG_RERANKER", "").strip()
 RERANK_CANDIDATES = int(os.environ.get("RAG_RERANK_CANDIDATES", "24"))
 
 # ---------------------------------------------------------------------------
+# Vector store client
+# ---------------------------------------------------------------------------
+# ChromaDB enables anonymised product telemetry by default, which posts usage
+# events to a third-party endpoint. That is the wrong default for a tool whose
+# entire premise is that the codebase never leaves the machine, and on a
+# locked-down network it is also a hang waiting to happen. Turn it off in the
+# one place both the indexer and the server construct a client.
+def chroma_client(path: str = None):
+    import chromadb
+    from chromadb.config import Settings
+    return chromadb.PersistentClient(
+        path=path or CHROMA_DIR,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Subprocess timeouts
 # ---------------------------------------------------------------------------
 # The live grep runs inside a tool call an agent is waiting on, so it must fail

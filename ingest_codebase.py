@@ -154,8 +154,7 @@ def ingest(repo_root, full=False):
         log("Chunker version changed -> forcing full rebuild.")
         full, prev_chunks, prev_manifest = True, {}, {}
 
-    import chromadb
-    client = chromadb.PersistentClient(path=cfg.CHROMA_DIR)
+    client = cfg.chroma_client()
     collection = client.get_or_create_collection(name=cfg.COLLECTION_NAME)
 
     checkpoint = None if full else read_checkpoint(repo_root)

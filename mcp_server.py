@@ -113,8 +113,7 @@ def _model():
 
 def _collection():
     if _state["collection"] is None:
-        import chromadb
-        client = chromadb.PersistentClient(path=cfg.CHROMA_DIR)
+        client = cfg.chroma_client()
         _state["collection"] = client.get_or_create_collection(name=cfg.COLLECTION_NAME)
     return _state["collection"]
 
