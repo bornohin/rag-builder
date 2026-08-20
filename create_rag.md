@@ -339,7 +339,7 @@ MODEL_ASSET_URL = os.environ.get(
     "RAG_MODEL_ASSET_URL",
     "https://github.com/bornohin/rag-builder/releases/download/models-v1/"
     "bge-small-en-v1.5-onnx-q.tar.gz")
-MODEL_ASSET_SHA256 = os.environ.get("RAG_MODEL_ASSET_SHA256", "21780c32b286a8661c740e77250104fd2cad03d75b4d598ea4ead8083724fe49")
+MODEL_ASSET_SHA256 = os.environ.get("RAG_MODEL_ASSET_SHA256", "3830f02a8ccbfb88dfe2cb460e2e5c6e2e1ac9e106f60c836e7ecf7b4cb42187")
 # Set RAG_SKIP_MODEL_ASSET=1 to ignore the asset and always use HuggingFace.
 SKIP_MODEL_ASSET = os.environ.get("RAG_SKIP_MODEL_ASSET", "") == "1"
 
@@ -2574,9 +2574,10 @@ def _safe_members(archive: tarfile.TarFile, root: str):
     """Yield only members that stay inside `root` once extracted.
 
     A tar entry may name `../../etc/whatever`, or be a symlink pointing out of
-    the tree -- unpacking one blindly writes wherever it likes. The model cache
-    legitimately contains relative symlinks (snapshots/ into blobs/), so they
-    cannot simply be rejected; each one is resolved and checked instead.
+    the tree -- unpacking one blindly writes wherever it likes. The published
+    asset contains no links at all, so in practice the link branch below never
+    fires; it stays because the URL is overridable and an archive from anywhere
+    else should not get a free pass.
     """
     root = os.path.realpath(root)
     for member in archive.getmembers():
