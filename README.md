@@ -63,6 +63,7 @@ Register it with any MCP-capable client as a stdio server:
 | **`create_rag.md`** | The runbook. A complete, self-contained build guide — survey the target repo, write each file, wire up the client, verify. Hand it to an agent or follow it yourself. |
 | [`docs/architecture.html`](docs/architecture.html) | A ten-slide visual explainer of how the whole thing works — the pipeline, chunking, hybrid search, rank fusion, and where it breaks at scale. Open it in a browser. |
 | `skills/rag/SKILL.md` | An interactive, one-step-at-a-time setup skill for agents that support skills. |
+| [`docs/OFFLINE-SETUP.md`](docs/OFFLINE-SETUP.md) | Setting up where HuggingFace is blocked: the model asset URL and digest, a paste-ready brief for an AI agent, manual download steps, and troubleshooting. |
 | [`AGENTS.md`](AGENTS.md) | Project-agnostic agent instructions — what the assistant needs to use these tools instead of `grep`. Reference it from your project-root `CLAUDE.md` / `GEMINI.md` with `@rag-workspace/AGENTS.md`, or paste it in if your assistant has no import syntax. |
 | `rag_config.py` | Single source of truth: paths, model, exclusions, tokenizer, repo discovery. Everything overridable by env var. |
 | `rag_chunker.py` | Tree-sitter structure-aware chunking with exact line ranges, token-budget splitting, gap filling. |
