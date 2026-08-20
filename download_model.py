@@ -50,9 +50,10 @@ def _safe_members(archive: tarfile.TarFile, root: str):
     """Yield only members that stay inside `root` once extracted.
 
     A tar entry may name `../../etc/whatever`, or be a symlink pointing out of
-    the tree -- unpacking one blindly writes wherever it likes. The model cache
-    legitimately contains relative symlinks (snapshots/ into blobs/), so they
-    cannot simply be rejected; each one is resolved and checked instead.
+    the tree -- unpacking one blindly writes wherever it likes. The published
+    asset contains no links at all, so in practice the link branch below never
+    fires; it stays because the URL is overridable and an archive from anywhere
+    else should not get a free pass.
     """
     root = os.path.realpath(root)
     for member in archive.getmembers():
