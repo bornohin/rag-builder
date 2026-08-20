@@ -143,6 +143,28 @@ def query_prefix(model_name: str = MODEL_NAME) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Pre-built model cache (optional fast path)
+# ---------------------------------------------------------------------------
+# Downloading the weights from HuggingFace works, but it is the one setup step
+# that needs the public internet, and the one that fails on a locked-down
+# network or when upstream renames a repo. So the same cache is published as a
+# release asset on this project and download_model.py prefers it: fetch, verify
+# the digest, unpack. If the asset is unreachable for any reason it falls
+# straight back to HuggingFace, so nothing depends on the release existing.
+#
+# The digest is the point. An unverified tarball pulled from the internet and
+# unpacked into a directory the server later loads is exactly the supply-chain
+# hole the restricted unpickler closes on the index side; leaving it open here
+# would just move the problem.
+MODEL_ASSET_URL = os.environ.get(
+    "RAG_MODEL_ASSET_URL",
+    "https://github.com/bornohin/rag-builder/releases/download/models-v1/"
+    "bge-small-en-v1.5-onnx-q.tar.gz")
+MODEL_ASSET_SHA256 = os.environ.get("RAG_MODEL_ASSET_SHA256", "21780c32b286a8661c740e77250104fd2cad03d75b4d598ea4ead8083724fe49")
+# Set RAG_SKIP_MODEL_ASSET=1 to ignore the asset and always use HuggingFace.
+SKIP_MODEL_ASSET = os.environ.get("RAG_SKIP_MODEL_ASSET", "") == "1"
+
 # Hard ceiling of the encoder. Chunks longer than this are silently truncated
 # by the tokenizer, so the chunker splits before reaching it.
 MODEL_MAX_TOKENS = int(os.environ.get("RAG_MODEL_MAX_TOKENS", "512"))

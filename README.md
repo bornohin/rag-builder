@@ -22,7 +22,7 @@ git clone https://github.com/bornohin/rag-builder.git rag-workspace
 
 python3 -m venv rag-workspace/.poc-venv
 rag-workspace/.poc-venv/bin/pip install -r rag-workspace/requirements.txt
-rag-workspace/.poc-venv/bin/python3 rag-workspace/download_model.py
+rag-workspace/.poc-venv/bin/python3 rag-workspace/download_model.py   # ~4s from the release asset
 rag-workspace/.poc-venv/bin/python3 rag-workspace/ingest_codebase.py --full
 rag-workspace/install_hooks.sh          # optional; covers every repo found
 ```
@@ -69,6 +69,18 @@ Register it with any MCP-capable client as a stdio server:
 | `download_model.py` | One-time model cache warm-up (embedder, tokenizer, and the optional reranker). |
 | `install_hooks.sh` | Installs git hooks into **every** repo in the workspace, chaining any hooks already present. |
 | `sync_and_index.sh` | Manual sync: pulls every repo, then refreshes the index once. The command to run before you start work. |
+
+## Where the model comes from
+
+`download_model.py` tries three sources in order: an existing cache (offline, instant),
+this project's [`models-v1` release asset](../../releases/tag/models-v1) (~58 MB, digest
+verified, no HuggingFace round trip), then HuggingFace itself. The asset exists because
+that last step is the one part of setup that needs the public internet — the part that
+breaks behind a corporate proxy or the day an upstream repository is renamed. The
+fallback stays so nothing *depends* on the release being reachable.
+
+The tarball's SHA-256 is pinned in `rag_config.py` and checked before anything is
+unpacked; a mismatch refuses the archive and falls back rather than trusting it.
 
 ## A word on the generated index
 
@@ -117,6 +129,9 @@ setup, nothing phones home.
 | `RAG_POOL_PER_RESULT_FILTERED` | `10` | Same, for a path-filtered query. |
 | `RAG_POOL_REFERENCE_CHUNKS` | `2000` | Corpus size at which those multipliers apply exactly; the pool grows with √(chunks) beyond it. |
 | `RAG_POOL_MAX` | `500` | Hard ceiling on the candidate pool. |
+| `RAG_MODEL_ASSET_URL` | this project's release | Pre-built model cache fetched instead of hitting HuggingFace. |
+| `RAG_MODEL_ASSET_SHA256` | pinned digest | Expected SHA-256 of that asset. A mismatch refuses to unpack and falls back. |
+| `RAG_SKIP_MODEL_ASSET` | *(unset)* | Set to `1` to ignore the asset and always download from HuggingFace. |
 | `RAG_CHECKPOINT_EVERY` | `20` | Embed batches between ingest checkpoints. Lower it for tighter crash protection on very long ingests. |
 | `RAG_GREP_TIMEOUT` | `30` | Seconds before the live grep gives up. |
 | `RAG_REINDEX_TIMEOUT` | `1800` | Seconds before `reindex()` gives up. |
